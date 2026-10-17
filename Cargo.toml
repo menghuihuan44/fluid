@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fluid-core",
+    "crates/fluid-gfx",
+    "crates/fluid-capture",
+    "crates/fluid-app",
+    "crates/fluid-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+parking_lot = "0.12"
+font8x8 = "0.3"
+eframe = "0.29"
+tray-icon = "0.19"
+
+[workspace.dependencies.fluid-core]
+path = "crates/fluid-core"
+
+[workspace.dependencies.fluid-gfx]
+path = "crates/fluid-gfx"
+
+[workspace.dependencies.fluid-capture]
+path = "crates/fluid-capture"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 1

@@ -1,0 +1,10 @@
+[package]
+name = "fluid-testkit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fluid-core.workspace = true
+fluid-gfx.workspace = true
+fluid-capture.workspace = true
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }

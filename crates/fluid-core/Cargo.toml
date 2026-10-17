@@ -1,0 +1,12 @@
+[package]
+name = "fluid-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+directories.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
