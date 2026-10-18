@@ -9,6 +9,7 @@ use crate::error::GfxError;
 use crate::hud::HudTexture;
 use crate::shaders;
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11BlendState, ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext,
@@ -27,6 +28,13 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct HudParams {
+    tex_rect: [f32; 4],
+    dest_rect: [f32; 4],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -82,6 +90,30 @@ impl Default for RenderOptions {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct HudOptions {
+    /// 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right, 4=custom.
+    pub anchor: u32,
+    pub margin: f32,
+    pub custom_x: f32,
+    pub custom_y: f32,
+    pub font_scale: u8,
+    pub background_alpha: u8,
+}
+
+impl Default for HudOptions {
+    fn default() -> Self {
+        Self {
+            anchor: 0,
+            margin: 12.0,
+            custom_x: 0.5,
+            custom_y: 0.5,
+            font_scale: 2,
+            background_alpha: 160,
+        }
+    }
+}
+
 pub struct RenderTargetInfo<'a> {
     pub rtv: &'a ID3D11RenderTargetView,
     pub width: f32,
@@ -95,6 +127,7 @@ pub struct RenderRequest<'a> {
     pub current: &'a FrameSnapshot,
     pub options: RenderOptions,
     pub hud_text: Option<&'a str>,
+    pub hud: HudOptions,
 }
 
 #[derive(Clone)]
@@ -145,11 +178,14 @@ pub struct Renderer {
     sampler: ID3D11SamplerState,
     cbuf: ID3D11Buffer,
     flow_cbuf: ID3D11Buffer,
+    hud_cbuf: ID3D11Buffer,
     blend_opaque: ID3D11BlendState,
     blend_premult: ID3D11BlendState,
     rasterizer: ID3D11RasterizerState,
+    rasterizer_scissor: ID3D11RasterizerState,
     hud: HudTexture,
     hud_last_update: Option<Instant>,
+    hud_last_style: Option<(u8, u8)>,
     ring: Vec<FrameSlot>,
     ring_w: u32,
     ring_h: u32,
@@ -266,6 +302,7 @@ impl Renderer {
             };
             let cbuf = make_cbuf(std::mem::size_of::<PerFrame>() as u32)?;
             let flow_cbuf = make_cbuf(std::mem::size_of::<FlowParams>() as u32)?;
+            let hud_cbuf = make_cbuf(std::mem::size_of::<HudParams>() as u32)?;
 
             let opaque = D3D11_RENDER_TARGET_BLEND_DESC {
                 BlendEnable: false.into(),
@@ -317,6 +354,13 @@ impl Renderer {
             let mut rasterizer = None;
             device.CreateRasterizerState(&raster_desc, Some(&mut rasterizer))?;
 
+            let scissor_desc = D3D11_RASTERIZER_DESC {
+                ScissorEnable: true.into(),
+                ..raster_desc
+            };
+            let mut rasterizer_scissor = None;
+            device.CreateRasterizerState(&scissor_desc, Some(&mut rasterizer_scissor))?;
+
             let mk_query = |q: D3D11_QUERY| -> windows::core::Result<ID3D11Query> {
                 let mut query = None;
                 device.CreateQuery(
@@ -356,11 +400,14 @@ impl Renderer {
                 sampler: sampler.unwrap(),
                 cbuf,
                 flow_cbuf,
+                hud_cbuf,
                 blend_opaque: blend_opaque.unwrap(),
                 blend_premult: blend_premult.unwrap(),
                 rasterizer: rasterizer.unwrap(),
+                rasterizer_scissor: rasterizer_scissor.unwrap(),
                 hud,
                 hud_last_update: None,
+                hud_last_style: None,
                 ring: Vec::new(),
                 ring_w: 0,
                 ring_h: 0,
@@ -407,6 +454,16 @@ impl Renderer {
         self.flow_key = None;
         tracing::info!("frame ring allocated: {len} x {w}x{h}, format={format:?}");
         Ok(())
+    }
+
+    pub fn clear_frames(&mut self) {
+        for slot in &mut self.ring {
+            slot.qpc = 0;
+            slot.seq = 0;
+        }
+        self.head = 0;
+        self.seq = 0;
+        self.flow_key = None;
     }
 
     pub fn ring_len(&self) -> usize {
@@ -501,14 +558,68 @@ impl Renderer {
         self.gpu_us
     }
 
-    fn hud_rect(&self, bb_w: f32, bb_h: f32) -> [f32; 4] {
-        let (hw, hh) = self.hud.size();
-        [
+    fn hud_draw_rects(
+        &self,
+        bb_w: f32,
+        bb_h: f32,
+        hud: &HudOptions,
+    ) -> Option<([f32; 4], [f32; 4], RECT)> {
+        let (content_w, content_h) = self.hud.content_size();
+        if content_w == 0 || content_h == 0 {
+            return None;
+        }
+        let (texture_w, texture_h) = self.hud.size();
+        let bb_w = bb_w.max(1.0);
+        let bb_h = bb_h.max(1.0);
+        let margin = hud.margin.max(0.0);
+        // If the target window is smaller than the full HUD panel, scale the
+        // panel down so corner anchors remain geometrically correct instead of
+        // collapsing to the left/top edge.
+        let available_w = (bb_w - margin * 2.0).max(1.0);
+        let available_h = (bb_h - margin * 2.0).max(1.0);
+        let raw_width = content_w as f32;
+        let raw_height = content_h as f32;
+        let fit = (available_w / raw_width)
+            .min(available_h / raw_height)
+            .min(1.0);
+        let width = raw_width * fit;
+        let height = raw_height * fit;
+        let max_x = (bb_w - width).max(0.0);
+        let max_y = (bb_h - height).max(0.0);
+        let (x, y) = match hud.anchor {
+            1 => ((max_x - margin).max(0.0), margin.min(max_y)),
+            2 => (margin.min(max_x), (max_y - margin).max(0.0)),
+            3 => ((max_x - margin).max(0.0), (max_y - margin).max(0.0)),
+            4 => (
+                hud.custom_x.clamp(0.0, 1.0) * max_x,
+                hud.custom_y.clamp(0.0, 1.0) * max_y,
+            ),
+            _ => (margin.min(max_x), margin.min(max_y)),
+        };
+        let left = x.floor().max(0.0);
+        let top = y.floor().max(0.0);
+        let right = (x + width).ceil().min(bb_w);
+        let bottom = (y + height).ceil().min(bb_h);
+        if right <= left || bottom <= top {
+            return None;
+        }
+        let tex_rect = [
             0.0,
             0.0,
-            (hw as f32 / bb_w.max(1.0)).min(1.0),
-            (hh as f32 / bb_h.max(1.0)).min(1.0),
-        ]
+            content_w as f32 / texture_w.max(1) as f32,
+            content_h as f32 / texture_h.max(1) as f32,
+        ];
+        let dest_rect = [x / bb_w, y / bb_h, (x + width) / bb_w, (y + height) / bb_h];
+        Some((
+            tex_rect,
+            dest_rect,
+            RECT {
+                left: left as i32,
+                top: top as i32,
+                right: right as i32,
+                bottom: bottom as i32,
+            },
+        ))
     }
 
     fn ensure_output(&mut self, w: u32, h: u32) -> Result<(), GfxError> {
@@ -645,6 +756,7 @@ impl Renderer {
             current,
             options,
             hud_text,
+            hud,
         } = request;
         let rtv = target.rtv;
         let bb_w = target.width;
@@ -688,7 +800,7 @@ impl Renderer {
             }
         }
 
-        let hud_rect = self.hud_rect(bb_w, bb_h);
+        let hud_rect = [0.0, 0.0, 1.0, 1.0];
         let cb = PerFrame {
             uv_rect,
             hud_rect,
@@ -803,21 +915,46 @@ impl Renderer {
                 .PSSetShaderResources(0, Some(&[Some(output_srv.clone())]));
             self.ctx.Draw(3, 0);
 
-            // Pass 3: premultiplied-alpha HUD.
+            // Pass 3: premultiplied-alpha, scissored real-time HUD.
             if let Some(text) = hud_text {
-                let should_update = self
-                    .hud_last_update
-                    .is_none_or(|last| last.elapsed() >= Duration::from_millis(250));
+                let style_key = (hud.font_scale, hud.background_alpha);
+                let style_changed = self.hud_last_style != Some(style_key);
+                let should_update = style_changed
+                    || self
+                        .hud_last_update
+                        .is_none_or(|last| last.elapsed() >= Duration::from_millis(250));
                 if should_update {
-                    self.hud.update(&self.ctx, text);
+                    self.hud
+                        .update(&self.ctx, text, hud.font_scale, hud.background_alpha);
                     self.hud_last_update = Some(Instant::now());
+                    self.hud_last_style = Some(style_key);
                 }
-                self.ctx.PSSetShader(&self.ps_hud, None);
-                self.ctx
-                    .PSSetShaderResources(0, Some(&[Some(self.hud.srv().clone())]));
-                self.ctx
-                    .OMSetBlendState(Some(&self.blend_premult), None, 0xffff_ffff);
-                self.ctx.Draw(3, 0);
+                if let Some((tex_rect, dest_rect, scissor)) = self.hud_draw_rects(bb_w, bb_h, &hud)
+                {
+                    let hud_params = HudParams {
+                        tex_rect,
+                        dest_rect,
+                    };
+                    self.ctx.UpdateSubresource(
+                        &self.hud_cbuf,
+                        0,
+                        None,
+                        &hud_params as *const HudParams as *const core::ffi::c_void,
+                        0,
+                        0,
+                    );
+                    self.ctx.PSSetShader(&self.ps_hud, None);
+                    self.ctx
+                        .PSSetConstantBuffers(1, Some(&[Some(self.hud_cbuf.clone())]));
+                    self.ctx
+                        .PSSetShaderResources(0, Some(&[Some(self.hud.srv().clone())]));
+                    self.ctx
+                        .OMSetBlendState(Some(&self.blend_premult), None, 0xffff_ffff);
+                    self.ctx.RSSetState(Some(&self.rasterizer_scissor));
+                    self.ctx.RSSetScissorRects(Some(&[scissor]));
+                    self.ctx.Draw(3, 0);
+                    self.ctx.RSSetState(Some(&self.rasterizer));
+                }
             }
 
             self.ctx.End(&self.queries[qp_slot].end);

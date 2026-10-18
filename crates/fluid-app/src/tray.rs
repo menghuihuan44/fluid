@@ -1,21 +1,22 @@
-﻿//! Tray icon thread with its own Win32 message pump.
+//! Tray icon thread with its own Win32 message pump.
 //!
 //! The TrayIcon object is kept alive inside the thread and dropped when the
 //! thread receives WM_QUIT. This removes the shell icon synchronously instead
 //! of relying on process termination.
 
 use crate::pipeline::Command;
+use fluid_core::{RunState, SharedState};
 use font8x8::UnicodeFonts;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetClassNameW, GetMessageW, GetWindowTextW,
-    GetWindowThreadProcessId, PostThreadMessageW, SetForegroundWindow, ShowWindow,
+    GetWindowThreadProcessId, PostThreadMessageW, SetForegroundWindow, ShowWindowAsync,
     TranslateMessage, MSG, SW_RESTORE, WM_QUIT,
 };
 
@@ -25,12 +26,18 @@ pub const ID_QUIT: &str = "fluid.quit";
 static TRAY_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static MENU_EVENTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static COMMAND_SENDER: OnceLock<Mutex<Option<Sender<Command>>>> = OnceLock::new();
+static SHARED_STATE: OnceLock<Arc<SharedState>> = OnceLock::new();
+static OPENING: AtomicBool = AtomicBool::new(false);
 
 pub fn set_command_sender(sender: Sender<Command>) {
     let slot = COMMAND_SENDER.get_or_init(|| Mutex::new(None));
     if let Ok(mut slot) = slot.lock() {
         *slot = Some(sender);
     }
+}
+
+pub fn set_shared_state(shared: Arc<SharedState>) {
+    let _ = SHARED_STATE.set(shared);
 }
 
 fn menu_events() -> &'static Mutex<Vec<String>> {
@@ -51,19 +58,7 @@ pub fn spawn() {
         MenuEvent::set_event_handler(Some(|event: MenuEvent| {
             let id = event.id().0.clone();
             match id.as_str() {
-                ID_OPEN => {
-                    // Stop capture first so a topmost overlay cannot cover the
-                    // settings window. Users can restart after adjusting.
-                    if let Some(slot) = COMMAND_SENDER.get() {
-                        if let Ok(slot) = slot.lock() {
-                            if let Some(sender) = slot.as_ref() {
-                                let _ = sender.send(Command::Stop);
-                            }
-                        }
-                    }
-                    crate::wake::wake();
-                    show_main_window();
-                }
+                ID_OPEN => request_open_settings(),
                 ID_QUIT => {
                     if let Some(slot) = COMMAND_SENDER.get() {
                         if let Ok(slot) = slot.lock() {
@@ -72,12 +67,17 @@ pub fn spawn() {
                             }
                         }
                     }
-                    // Let the tray thread process WM_QUIT and drop the shell
-                    // icon, then terminate the process even if the eframe
-                    // window is minimized or hidden.
-                    shutdown();
+                    if let Ok(mut events) = menu_events().lock() {
+                        events.push(ID_QUIT.to_string());
+                    }
+                    crate::wake::wake();
+                    // Prefer the normal UI shutdown path so capture overlays,
+                    // HUD resources, config, tray icon and hotkeys are released
+                    // in order. Keep a bounded fallback for a wedged UI thread.
                     std::thread::spawn(|| {
-                        std::thread::sleep(std::time::Duration::from_millis(350));
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        shutdown();
+                        std::thread::sleep(std::time::Duration::from_millis(150));
                         std::process::exit(0);
                     });
                 }
@@ -89,6 +89,18 @@ pub fn spawn() {
                 }
             }
         }));
+        TrayIconEvent::set_event_handler(Some(|event: TrayIconEvent| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => request_open_settings(),
+            _ => {}
+        }));
     });
     let _ = std::thread::Builder::new()
         .name("fluid-tray".into())
@@ -99,6 +111,51 @@ pub fn spawn() {
                 tracing::error!("tray initialization failed: {e}");
             }
             TRAY_THREAD_ID.store(0, Ordering::SeqCst);
+        });
+}
+
+pub fn request_open_settings() {
+    if OPENING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // Pause the topmost capture overlay while the settings window is open.
+    // The persistent capture session stays alive and resumes automatically when
+    // the settings window loses focus.
+    if let Some(slot) = COMMAND_SENDER.get() {
+        if let Ok(slot) = slot.lock() {
+            if let Some(sender) = slot.as_ref() {
+                let _ = sender.send(Command::SetPaused(true));
+            }
+        }
+    }
+    if let Ok(mut events) = menu_events().lock() {
+        events.push(ID_OPEN.to_string());
+    }
+    crate::wake::wake();
+
+    let shared = SHARED_STATE.get().cloned();
+    let _ = std::thread::Builder::new()
+        .name("fluid-open-settings".into())
+        .spawn(move || {
+            // Wait until the pipeline has dropped its overlay. If it is stuck,
+            // still restore the UI after a bounded delay so the tray cannot
+            // become a permanent trap.
+            if let Some(shared) = shared {
+                for _ in 0..40 {
+                    if matches!(
+                        *shared.state.lock(),
+                        RunState::Paused | RunState::Idle | RunState::Failed
+                    ) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            show_main_window();
+            crate::wake::wake();
+            OPENING.store(false, Ordering::SeqCst);
         });
 }
 
@@ -125,7 +182,7 @@ fn tray_thread() -> Result<(), Box<dyn std::error::Error>> {
         .with_icon(icon)
         .with_tooltip("fluid — 帧生成 + 画质提升")
         .with_menu(Box::new(menu))
-        .with_menu_on_left_click(true)
+        .with_menu_on_left_click(false)
         .build()?;
 
     unsafe {
@@ -180,7 +237,7 @@ fn show_main_window() {
             LPARAM(&mut context as *mut FindMainWindow as isize),
         );
         if let Some(hwnd) = context.result {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
             let _ = SetForegroundWindow(hwnd);
         }
     }

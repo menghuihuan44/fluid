@@ -6,7 +6,9 @@
 
 use crate::error::GfxError;
 use windows::core::{w, IUnknown, Interface};
-use windows::Win32::Foundation::{BOOL, COLORREF, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    BOOL, COLORREF, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11RenderTargetView, ID3D11Texture2D};
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
@@ -31,7 +33,31 @@ unsafe extern "system" fn overlay_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
+    const WM_NCHITTEST: u32 = 0x0084;
+    const WM_MOUSEACTIVATE: u32 = 0x0021;
+    const HTTRANSPARENT: isize = -1;
+    const MA_NOACTIVATE: usize = 3;
+    match msg {
+        // Pass every mouse hit through to the window underneath. This is the
+        // definitive click-through path; WS_EX_TRANSPARENT alone is not enough
+        // on all DirectComposition/layered-window combinations.
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Dispatch pending Win32 messages for overlay windows. Overlay windows live on
+/// the pipeline/HUD threads, which otherwise only run D3D loops; without this,
+/// hovering a window can make Windows treat its owning thread as unresponsive.
+pub fn pump_thread_messages() {
+    unsafe {
+        let mut msg = MSG::default();
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
 }
 
 fn register_class() {
@@ -64,6 +90,7 @@ pub struct OverlayWindow {
     height: u32,
     visible: bool,
     last_rect: Option<(i32, i32, i32, i32)>,
+    z_anchor: Option<HWND>,
 }
 
 impl OverlayWindow {
@@ -101,6 +128,20 @@ impl OverlayWindow {
         };
 
         unsafe {
+            // Re-assert click-through/activation styles after CreateWindow.
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let click_through =
+                WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0;
+            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (style | click_through) as isize);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
             // 完全不透明，但保留鼠标穿透（WS_EX_TRANSPARENT 需要 LAYERED 才生效）
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
             match SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
@@ -162,6 +203,7 @@ impl OverlayWindow {
             height: h,
             visible: false,
             last_rect: None,
+            z_anchor: None,
         };
         this.rtv = Some(this.create_rtv()?);
         Ok(this)
@@ -202,32 +244,38 @@ impl OverlayWindow {
             self.resize(w, h)?;
         }
         if self.last_rect == Some(key) {
-            if !self.visible {
-                self.show(true);
-            }
             return Ok(());
+        }
+        if self
+            .z_anchor
+            .is_some_and(|h| !unsafe { IsWindow(h).as_bool() })
+        {
+            self.z_anchor = unsafe {
+                FindWindowW(w!("Shell_TrayWnd"), None)
+                    .or_else(|_| FindWindowW(w!("Shell_SecondaryTrayWnd"), None))
+                    .ok()
+            };
         }
         unsafe {
             SetWindowPos(
                 self.hwnd,
-                HWND_TOPMOST,
+                self.z_anchor.unwrap_or(HWND_TOPMOST),
                 rect.left,
                 rect.top,
                 w as i32,
                 h as i32,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOACTIVATE,
             )?;
         }
         self.last_rect = Some(key);
-        if !self.visible {
-            self.show(true);
-        }
         Ok(())
     }
 
     fn resize(&mut self, w: u32, h: u32) -> Result<(), GfxError> {
-        // 等待帧槽排空后再 ResizeBuffers
-        self.wait_present_slot(1000);
+        // Wait only briefly for the frame slot. A hidden target-switch overlay
+        // can legitimately have no retiring frame; waiting a full second here
+        // would freeze target following and make the UI appear hung.
+        self.wait_present_slot(if self.visible { 100 } else { 10 });
         self.rtv = None;
         unsafe {
             self.swapchain.ResizeBuffers(
@@ -245,6 +293,42 @@ impl OverlayWindow {
         Ok(())
     }
 
+    /// Keep this window at the top of the topmost band without moving,
+    /// resizing, activating, or changing its visibility.
+    pub fn set_keep_below_taskbar(&mut self, enabled: bool) {
+        if enabled {
+            self.z_anchor = unsafe {
+                FindWindowW(w!("Shell_TrayWnd"), None)
+                    .or_else(|_| FindWindowW(w!("Shell_SecondaryTrayWnd"), None))
+                    .ok()
+            };
+        } else {
+            self.z_anchor = None;
+        }
+    }
+
+    pub fn raise(&self) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                self.z_anchor.unwrap_or(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+        }
+    }
+
+    /// Apply a whole-window opacity (0 = transparent, 255 = opaque) using the
+    /// layered-window attribute. This is independent of the capture overlay.
+    pub fn set_alpha(&self, alpha: u8) {
+        unsafe {
+            let _ = SetLayeredWindowAttributes(self.hwnd, COLORREF(0), alpha, LWA_ALPHA);
+        }
+    }
+
     pub fn show(&mut self, visible: bool) {
         unsafe {
             let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
@@ -253,10 +337,8 @@ impl OverlayWindow {
     }
 
     /// 等待交换链帧槽空闲（MaximumFrameLatency=1 的节拍来源）。
-    pub fn wait_present_slot(&self, timeout_ms: u32) {
-        unsafe {
-            let _ = WaitForSingleObject(self.waitable, timeout_ms);
-        }
+    pub fn wait_present_slot(&self, timeout_ms: u32) -> bool {
+        unsafe { WaitForSingleObject(self.waitable, timeout_ms) == WAIT_OBJECT_0 }
     }
 
     pub fn present(&self, sync_interval: i32) {
@@ -278,6 +360,13 @@ impl OverlayWindow {
 impl Drop for OverlayWindow {
     fn drop(&mut self) {
         unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            // Detach DirectComposition content before destroying the HWND.
+            // Releasing the visual/swapchain after the window is gone can leave
+            // DWM/DComp in an inconsistent state on rapid target changes.
+            let _ = self._dcomp_visual.SetContent(None);
+            let _ = self._dcomp_target.SetRoot(None);
+            let _ = self.dcomp_device.Commit();
             let _ = DestroyWindow(self.hwnd);
         }
     }

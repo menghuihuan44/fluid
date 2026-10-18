@@ -21,6 +21,30 @@ pub struct ShaderBinaries {
     pub cs_flow: Vec<u8>,
 }
 
+#[derive(Clone)]
+pub struct HudShaderBinaries {
+    pub vs: Vec<u8>,
+    pub ps_hud: Vec<u8>,
+}
+
+/// Compile only the two shaders needed by the independent HUD window.
+pub fn compile_hud_only() -> Result<HudShaderBinaries, GfxError> {
+    static CACHE: OnceLock<Result<HudShaderBinaries, String>> = OnceLock::new();
+    let cached = CACHE.get_or_init(|| {
+        (|| -> Result<HudShaderBinaries, GfxError> {
+            Ok(HudShaderBinaries {
+                vs: compile(VS_FULLSCREEN, "vs_fullscreen", "main", "vs_5_0")?,
+                ps_hud: compile(PS_HUD, "ps_hud", "main", "ps_5_0")?,
+            })
+        })()
+        .map_err(|e| e.to_string())
+    });
+    match cached {
+        Ok(binaries) => Ok(binaries.clone()),
+        Err(message) => Err(GfxError::Other(message.clone())),
+    }
+}
+
 pub fn compile_all() -> Result<ShaderBinaries, GfxError> {
     static CACHE: OnceLock<Result<ShaderBinaries, String>> = OnceLock::new();
     let cached = CACHE.get_or_init(|| compile_all_uncached().map_err(|e| e.to_string()));

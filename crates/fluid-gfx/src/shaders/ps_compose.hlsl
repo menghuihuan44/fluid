@@ -150,14 +150,18 @@ float4 main(PSIn i) : SV_Target {
     // Suppress colour synthesis when the two warped samples disagree:
     // this catches occlusions, exposure changes, and scene cuts.
     float warped_delta = abs(luminance(prev_color) - luminance(curr_color));
-    float match_conf = saturate(1.0 - warped_delta * 3.0);
+    float match_conf = saturate(1.0 - warped_delta * 4.2);
 
     float3 static_prev = sample_bilinear(prev_tex, px);
     float static_delta = abs(luminance(static_prev) - luminance(current));
     float scene_conf = 1.0 - smoothstep(params2.x, params2.x + 0.18, static_delta);
 
     float strength = saturate(params1.w);
-    float confidence = match_conf * scene_conf * lerp(0.65, 1.0, search_confidence) * strength;
+    // When the motion field is weak, favour the real current frame over a
+    // warped blend. This trades a little synthetic smoothness for far less
+    // ghosting/double-image artefacts.
+    float flow_trust = smoothstep(0.04, 0.38, search_confidence);
+    float confidence = match_conf * scene_conf * flow_trust * strength;
 
     // Never introduce colours that are not present in either endpoint.
     mixed = clamp(mixed, min(prev_color, curr_color), max(prev_color, curr_color));

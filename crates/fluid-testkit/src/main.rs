@@ -23,6 +23,11 @@ fn main() {
                 std::process::exit(1);
             }
             println!("render motion/upscale selftest: PASS");
+            if let Err(e) = fluid_gfx::selftest::render_hud_window() {
+                eprintln!("render independent HUD selftest: FAIL: {e}");
+                std::process::exit(1);
+            }
+            println!("render independent HUD selftest: PASS");
         }
         Some("windows") => {
             for w in fluid_capture::enumerate_windows() {
@@ -36,6 +41,13 @@ fn main() {
                 );
             }
         }
+        Some("hud") => match fluid_gfx::selftest::render_hud_window() {
+            Ok(()) => println!("independent HUD selftest: PASS"),
+            Err(e) => {
+                eprintln!("independent HUD selftest: FAIL: {e}");
+                std::process::exit(1);
+            }
+        },
         Some("overlay") => match fluid_gfx::selftest::overlay_creation() {
             Ok(()) => println!("overlay selftest: PASS"),
             Err(e) => {
@@ -46,6 +58,12 @@ fn main() {
         Some("wgc") => {
             if let Err(e) = wgc_probe() {
                 eprintln!("WGC probe: FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("wgc-scan") => {
+            if let Err(e) = wgc_scan() {
+                eprintln!("WGC scan: FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -60,7 +78,7 @@ fn main() {
             capture_probe(secs);
         }
         _ => {
-            eprintln!("用法: fluid-testkit [render|windows|overlay|wgc|feedback|capture [秒]]");
+            eprintln!("用法: fluid-testkit [render|hud|windows|overlay|wgc|wgc-scan|feedback|capture [秒]]");
             std::process::exit(2);
         }
     }
@@ -294,6 +312,50 @@ fn wgc_probe() -> Result<(), String> {
         capture.width(),
         capture.height()
     );
+    Ok(())
+}
+
+fn wgc_scan() -> Result<(), String> {
+    let windows = fluid_capture::enumerate_windows();
+    let bundle = fluid_gfx::create_device().map_err(|e| format!("device: {e}"))?;
+    if bundle.is_warp {
+        return Err("WGC scan requires a hardware D3D11 device".into());
+    }
+    let mut ok = 0u32;
+    let mut fail = 0u32;
+    for window in windows
+        .iter()
+        .filter(|w| w.width() >= 160 && w.height() >= 120)
+    {
+        let hwnd = fluid_capture::window::hwnd_from_isize(window.hwnd);
+        match fluid_capture::WgcCapture::new(&bundle.device, hwnd) {
+            Ok(capture) => {
+                ok += 1;
+                println!(
+                    "OK   {:x}\t{}x{}\t{}\t{}",
+                    window.hwnd,
+                    window.width(),
+                    window.height(),
+                    window.class,
+                    window.title
+                );
+                drop(capture);
+            }
+            Err(e) => {
+                fail += 1;
+                println!(
+                    "FAIL {:x}\t{}x{}\t{}\t{}\t{}",
+                    window.hwnd,
+                    window.width(),
+                    window.height(),
+                    window.class,
+                    window.title,
+                    e
+                );
+            }
+        }
+    }
+    println!("WGC scan result: ok={ok} fail={fail}");
     Ok(())
 }
 

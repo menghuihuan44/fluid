@@ -1,6 +1,7 @@
 //! Global hotkeys on a dedicated Win32 message thread.
 //!
 //! Ctrl+Alt+Shift+F9: start/stop capture
+//! Ctrl+Alt+Shift+F8: open settings and stop capture
 //! Ctrl+Alt+Shift+F10: toggle HUD
 //!
 //! Start/stop and HUD commands are sent directly to the pipeline thread so they
@@ -14,7 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_F10, VK_F9,
+    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_F10, VK_F8,
+    VK_F9,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_HOTKEY, WM_QUIT,
@@ -22,6 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const HOTKEY_START_STOP: i32 = 1;
 const HOTKEY_TOGGLE_HUD: i32 = 2;
+const HOTKEY_OPEN_SETTINGS: i32 = 3;
 const WM_REFRESH_HOTKEYS: u32 = 0x8000 + 1;
 
 static THREAD_ID: AtomicU32 = AtomicU32::new(0);
@@ -94,17 +97,7 @@ fn resolve_plan() -> Option<CaptureRequest> {
             fluid_capture::is_window(window).then_some(CaptureRequest::Window { hwnd })
         }
         HotkeyPlan::Foreground { fallback_monitor } => {
-            if let Some(foreground) = fluid_capture::external_foreground_window()
-                .or_else(fluid_capture::last_external_foreground_window)
-            {
-                Some(CaptureRequest::Window {
-                    hwnd: foreground.0 as isize,
-                })
-            } else {
-                Some(CaptureRequest::Monitor {
-                    hmonitor: fallback_monitor,
-                })
-            }
+            Some(CaptureRequest::Foreground { fallback_monitor })
         }
     }
 }
@@ -118,6 +111,8 @@ fn toggle_capture(commands: &Sender<Command>, shared: &SharedState) {
         let _ = commands.send(Command::Stop);
     } else if let Some(request) = resolve_plan() {
         let _ = commands.send(Command::Start { request });
+        shared.minimize_ui_requested.store(true, Ordering::Relaxed);
+        crate::wake::wake();
     }
 }
 
@@ -131,9 +126,13 @@ fn update_registration() {
             if let Err(e) = RegisterHotKey(None, HOTKEY_TOGGLE_HUD, modifiers, VK_F10.0 as u32) {
                 tracing::warn!("failed to register Ctrl+Alt+Shift+F10: {e}");
             }
+            if let Err(e) = RegisterHotKey(None, HOTKEY_OPEN_SETTINGS, modifiers, VK_F8.0 as u32) {
+                tracing::warn!("failed to register Ctrl+Alt+Shift+F8: {e}");
+            }
         } else {
             let _ = UnregisterHotKey(None, HOTKEY_START_STOP);
             let _ = UnregisterHotKey(None, HOTKEY_TOGGLE_HUD);
+            let _ = UnregisterHotKey(None, HOTKEY_OPEN_SETTINGS);
         }
     }
 }
@@ -159,6 +158,10 @@ fn hotkey_thread(commands: Sender<Command>, shared: Arc<SharedState>) {
                         tracing::info!("global hotkey HUD toggle");
                         let _ = commands.send(Command::ToggleHud);
                     }
+                    HOTKEY_OPEN_SETTINGS => {
+                        tracing::info!("global hotkey open settings");
+                        crate::tray::request_open_settings();
+                    }
                     _ => {}
                 }
             } else {
@@ -168,5 +171,6 @@ fn hotkey_thread(commands: Sender<Command>, shared: Arc<SharedState>) {
         }
         let _ = UnregisterHotKey(None, HOTKEY_START_STOP);
         let _ = UnregisterHotKey(None, HOTKEY_TOGGLE_HUD);
+        let _ = UnregisterHotKey(None, HOTKEY_OPEN_SETTINGS);
     }
 }

@@ -4,21 +4,59 @@
 
 use fluid_capture::clock::{qpc_freq, qpc_now};
 use fluid_capture::duplication::{CaptureError, Duplication};
-use fluid_capture::monitor::{monitor_rect, monitor_refresh_hz};
+use fluid_capture::monitor::{enumerate_monitors, monitor_rect, monitor_refresh_hz};
 use fluid_capture::wgc::WgcCapture;
-use fluid_capture::window::{client_rect_on_screen, is_iconic, is_window, monitor_of, uv_rect};
+use fluid_capture::window::{
+    client_rect_on_screen, is_foreground_capture_candidate, is_iconic, is_window, monitor_of,
+    uv_rect,
+};
 use fluid_core::time::qpc_diff_us;
 use fluid_core::{AppConfig, OutputMode, PresentMode, RunState, ScaleMode, SharedState, Stats};
 use fluid_gfx::{
-    create_device, DeviceBundle, OverlayWindow, RenderOptions, RenderRequest, RenderTargetInfo,
-    Renderer,
+    create_device, DeviceBundle, HudOptions, OverlayWindow, RenderOptions, RenderRequest,
+    RenderTargetInfo, Renderer,
 };
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{FILETIME, HWND};
 use windows::Win32::Graphics::Gdi::HMONITOR;
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+const STAGE_TICK: u32 = 0;
+const STAGE_SELECT: u32 = 1;
+const STAGE_GRACE: u32 = 2;
+const STAGE_WGC_DISCARD: u32 = 3;
+const STAGE_WGC_NEW: u32 = 4;
+const STAGE_RING: u32 = 5;
+const STAGE_DDA_NEW: u32 = 6;
+const STAGE_CAPTURE: u32 = 7;
+const STAGE_OVERLAY_PLACE: u32 = 8;
+const STAGE_PACE: u32 = 9;
+const STAGE_RENDER: u32 = 10;
+const STAGE_PRESENT: u32 = 11;
+const STAGE_SUSPEND: u32 = 12;
+
+pub(crate) fn stage_name(stage: u32) -> &'static str {
+    match stage {
+        STAGE_TICK => "tick-start",
+        STAGE_SELECT => "select-target",
+        STAGE_GRACE => "target-grace",
+        STAGE_WGC_DISCARD => "wgc-discard",
+        STAGE_WGC_NEW => "wgc-new",
+        STAGE_RING => "ring-allocate",
+        STAGE_DDA_NEW => "dda-new",
+        STAGE_CAPTURE => "capture-acquire",
+        STAGE_OVERLAY_PLACE => "overlay-place",
+        STAGE_PACE => "frame-pacing",
+        STAGE_RENDER => "renderer-render",
+        STAGE_PRESENT => "overlay-present",
+        STAGE_SUSPEND => "session-suspend",
+        _ => "unknown",
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum CaptureRequest {
@@ -27,14 +65,15 @@ pub enum CaptureRequest {
     Monitor { hmonitor: isize },
     /// Capture (and track) one window rectangle.
     Window { hwnd: isize },
+    /// Dynamically follow the current external foreground window with WGC.
+    /// If no foreground window is available, use the fallback monitor with DDA
+    /// until a window appears.
+    Foreground { fallback_monitor: isize },
 }
 
 pub enum Command {
-    Start {
-        request: CaptureRequest,
-    },
+    Start { request: CaptureRequest },
     Stop,
-    #[allow(dead_code)]
     SetPaused(bool),
     ToggleHud,
     Config(AppConfig),
@@ -50,9 +89,20 @@ impl Pipeline {
     pub fn spawn(shared: Arc<SharedState>, init_cfg: AppConfig) -> Self {
         let (tx, rx) = mpsc::channel::<Command>();
         let shared2 = shared.clone();
+        let shared_for_panic = shared.clone();
         std::thread::Builder::new()
             .name("fluid-pipeline".into())
-            .spawn(move || thread_main(shared2, rx, init_cfg))
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    thread_main(shared2, rx, init_cfg)
+                }));
+                if result.is_err() {
+                    shared_for_panic.set_state(
+                        RunState::Failed,
+                        "pipeline thread panicked; please restart capture",
+                    );
+                }
+            })
             .expect("failed to start pipeline thread");
         Self { tx, shared }
     }
@@ -67,7 +117,6 @@ impl Pipeline {
 }
 
 enum TickErr {
-    Fatal(String),
     Recoverable(String),
 }
 
@@ -80,53 +129,91 @@ fn thread_main(shared: Arc<SharedState>, rx: mpsc::Receiver<Command>, init_cfg: 
     }
     let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
     info!("pipeline thread started (id={thread_id})");
+    shared
+        .hud_enabled
+        .store(init_cfg.display.show_hud, Ordering::Relaxed);
     let mut cfg = init_cfg;
     let mut session: Option<Session> = None;
+    let mut active = false;
     let mut paused = false;
     shared.set_state(RunState::Idle, "");
 
     loop {
-        let cmd = if session.is_none() {
-            rx.recv().ok()
+        fluid_gfx::pump_thread_messages();
+        let cmd = if !active {
+            match rx.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            }
         } else {
             rx.try_recv().ok()
         };
         match cmd {
             Some(Command::Stop) => {
-                if session.is_some() {
-                    info!("pipeline session stopped by command");
+                if let Some(s) = session.as_mut() {
+                    info!("pipeline session suspended by command");
+                    s.suspend();
                 }
-                session = None;
+                active = false;
                 paused = false;
                 shared.stats.fg_active.store(0, Ordering::Relaxed);
                 shared.set_state(RunState::Idle, "");
                 continue;
             }
             Some(Command::Config(c)) => {
+                shared
+                    .hud_enabled
+                    .store(c.display.show_hud, Ordering::Relaxed);
                 cfg = c;
                 if let Some(s) = session.as_mut() {
                     s.mark_dirty();
                 }
             }
-            Some(Command::SetPaused(p)) => paused = p,
+            Some(Command::SetPaused(p)) => {
+                if paused != p {
+                    paused = p;
+                    if let Some(s) = session.as_mut() {
+                        if p {
+                            tracing::info!("capture overlay paused while settings is foreground");
+                            s.suspend();
+                        } else {
+                            tracing::info!("capture overlay resumed after settings lost focus");
+                            s.prepare_resume();
+                        }
+                    }
+                }
+            }
             Some(Command::ToggleHud) => {
                 cfg.display.show_hud = !cfg.display.show_hud;
+                shared
+                    .hud_enabled
+                    .store(cfg.display.show_hud, Ordering::Relaxed);
                 if let Some(s) = session.as_mut() {
                     s.mark_dirty();
                 }
             }
             Some(Command::Start { request }) => {
                 shared.set_state(RunState::Starting, "");
-                match Session::new(request, shared.clone()) {
-                    Ok(s) => {
-                        info!("pipeline session started: {request:?}");
-                        session = Some(s);
-                        paused = false;
-                        shared.set_state(RunState::Running, "");
-                    }
-                    Err(e) => {
-                        error!("session start failed: {e}");
-                        shared.set_state(RunState::Failed, &e);
+                if let Some(s) = session.as_mut() {
+                    info!("pipeline session resumed: {request:?}");
+                    s.reconfigure(request);
+                    active = true;
+                    paused = false;
+                    shared.set_state(RunState::Running, "");
+                } else {
+                    match Session::new(request, shared.clone()) {
+                        Ok(s) => {
+                            info!("pipeline session started: {request:?}");
+                            session = Some(s);
+                            active = true;
+                            paused = false;
+                            shared.set_state(RunState::Running, "");
+                        }
+                        Err(e) => {
+                            error!("session start failed: {e}");
+                            active = false;
+                            shared.set_state(RunState::Failed, &e);
+                        }
                     }
                 }
                 continue;
@@ -134,7 +221,13 @@ fn thread_main(shared: Arc<SharedState>, rx: mpsc::Receiver<Command>, init_cfg: 
             None => {}
         }
 
-        let Some(s) = session.as_mut() else { continue };
+        let Some(s) = session.as_mut() else {
+            active = false;
+            continue;
+        };
+        if !active {
+            continue;
+        }
         if paused {
             s.hide_overlay();
             shared.stats.fg_active.store(0, Ordering::Relaxed);
@@ -144,18 +237,32 @@ fn thread_main(shared: Arc<SharedState>, rx: mpsc::Receiver<Command>, init_cfg: 
         }
         match s.tick(&cfg) {
             Ok(()) => shared.set_state(RunState::Running, ""),
-            Err(TickErr::Fatal(m)) => {
-                error!("pipeline terminated: {m}");
-                session = None;
-                shared.stats.fg_active.store(0, Ordering::Relaxed);
-                shared.set_state(RunState::Failed, &m);
-            }
             Err(TickErr::Recoverable(m)) => {
                 warn!("recoverable pipeline error: {m}");
+                s.hide_overlay();
                 shared.set_state(RunState::Running, &m);
                 s.invalidate_capture();
                 std::thread::sleep(Duration::from_millis(200));
             }
+        }
+    }
+}
+
+fn filetime_ticks(time: FILETIME) -> u64 {
+    ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64
+}
+
+fn sleep_until(deadline: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline - now;
+        if remaining > Duration::from_millis(1) {
+            std::thread::sleep(remaining - Duration::from_millis(1));
+        } else {
+            std::thread::yield_now();
         }
     }
 }
@@ -168,7 +275,16 @@ struct Session {
     renderer: Renderer,
     dup: Option<Duplication>,
     wgc: Option<WgcCapture>,
+    wgc_hwnd: Option<isize>,
+    wgc_monitor: Option<isize>,
     wgc_target_size: Option<(u32, u32)>,
+    pending_target_size: Option<((u32, u32), Instant)>,
+    current_window: Option<HWND>,
+    pending_window: Option<(HWND, Instant)>,
+    failed_window: Option<(HWND, Instant)>,
+    fallback_grace_until: Option<Instant>,
+    dda_retry_after: Option<Instant>,
+    monitor_wgc_disabled: bool,
     monitor: isize,
     next_tick: Option<Instant>,
     refresh_hz: f32,
@@ -182,6 +298,15 @@ struct Session {
     last_present_qpc: i64,
     last_debug_log: Instant,
     last_debug_generated: u64,
+    last_metrics_sample: Instant,
+    last_generated_count: u64,
+    last_process_cpu_100ns: u64,
+    fg_backoff_until: Option<Instant>,
+    overload_count: u32,
+    fg_underperf_count: u32,
+    fg_low_gain_count: u32,
+    fg_perf_until: Option<Instant>,
+    keep_overlay_below_taskbar: bool,
     freq: u64,
 }
 
@@ -207,7 +332,16 @@ impl Session {
             renderer,
             dup: None,
             wgc: None,
+            wgc_hwnd: None,
+            wgc_monitor: None,
             wgc_target_size: None,
+            pending_target_size: None,
+            current_window: None,
+            pending_window: None,
+            failed_window: None,
+            fallback_grace_until: None,
+            dda_retry_after: None,
+            monitor_wgc_disabled: false,
             monitor: -1,
             next_tick: None,
             refresh_hz: 60.0,
@@ -221,6 +355,15 @@ impl Session {
             last_present_qpc: 0,
             last_debug_log: Instant::now(),
             last_debug_generated: 0,
+            last_metrics_sample: Instant::now(),
+            last_generated_count: 0,
+            last_process_cpu_100ns: 0,
+            fg_backoff_until: None,
+            overload_count: 0,
+            fg_underperf_count: 0,
+            fg_low_gain_count: 0,
+            fg_perf_until: None,
+            keep_overlay_below_taskbar: false,
             freq: qpc_freq(),
         })
     }
@@ -229,65 +372,474 @@ impl Session {
         self.dirty = true;
     }
 
+    fn set_stage(&self, stage: u32) {
+        self.shared.pipeline_stage.store(stage, Ordering::Relaxed);
+    }
+
+    fn suspend(&mut self) {
+        self.set_stage(STAGE_SUSPEND);
+        self.discard_wgc();
+        self.dup = None;
+        self.current_window = None;
+        self.pending_window = None;
+        self.pending_target_size = None;
+        self.fg_backoff_until = None;
+        self.overload_count = 0;
+        self.fg_underperf_count = 0;
+        self.fg_low_gain_count = 0;
+        self.fg_perf_until = None;
+        self.fg_underperf_count = 0;
+        self.fg_low_gain_count = 0;
+        self.fg_perf_until = None;
+        self.has_frame = false;
+        self.dirty = true;
+        self.next_tick = None;
+        self.hide_overlay();
+    }
+
+    fn prepare_resume(&mut self) {
+        self.renderer.clear_frames();
+        self.current_window = None;
+        self.pending_window = None;
+        self.failed_window = None;
+        self.has_frame = false;
+        self.dirty = true;
+        self.next_tick = None;
+        self.last_capture_qpc = 0;
+        self.capture_interval_us = 1_000_000.0 / 60.0;
+        self.last_present_qpc = 0;
+        self.last_present_tick = None;
+    }
+
+    fn reconfigure(&mut self, request: CaptureRequest) {
+        self.request = request;
+        self.discard_wgc();
+        self.dup = None;
+        self.current_window = None;
+        self.pending_window = None;
+        self.pending_target_size = None;
+        self.failed_window = None;
+        self.fallback_grace_until = None;
+        self.dda_retry_after = None;
+        self.monitor_wgc_disabled = false;
+        self.fg_backoff_until = None;
+        self.overload_count = 0;
+        self.fg_underperf_count = 0;
+        self.fg_low_gain_count = 0;
+        self.fg_perf_until = None;
+        self.monitor = -1;
+        self.next_tick = None;
+        self.last_capture_qpc = 0;
+        self.capture_interval_us = 1_000_000.0 / 60.0;
+        self.last_present_tick = None;
+        self.last_present_qpc = 0;
+        self.last_output_rect = None;
+        self.has_frame = false;
+        self.dirty = true;
+        self.renderer.clear_frames();
+        self.hide_overlay();
+    }
+
+    fn sample_system_metrics(&mut self) {
+        let elapsed = self.last_metrics_sample.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let generated = self.shared.stats.generated_frames.load(Ordering::Relaxed);
+        let generated_delta = generated.saturating_sub(self.last_generated_count);
+        Stats::ema_x100(
+            &self.shared.stats.generated_fps_x100,
+            generated_delta as f64 / elapsed.as_secs_f64(),
+            0.5,
+        );
+        self.last_generated_count = generated;
+
+        unsafe {
+            let process = GetCurrentProcess();
+            let mut creation = FILETIME::default();
+            let mut exit = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            if GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user).is_ok() {
+                let total = filetime_ticks(kernel) + filetime_ticks(user);
+                if self.last_process_cpu_100ns > 0 {
+                    let cpu_delta = total.saturating_sub(self.last_process_cpu_100ns);
+                    let elapsed_100ns = (elapsed.as_secs_f64() * 1.0e7) as u64;
+                    if elapsed_100ns > 0 {
+                        let cpu_percent = cpu_delta as f64 / elapsed_100ns as f64 * 100.0;
+                        Stats::ema_x100(&self.shared.stats.process_cpu_x100, cpu_percent, 0.35);
+                    }
+                }
+                self.last_process_cpu_100ns = total;
+            }
+
+            let mut counters = PROCESS_MEMORY_COUNTERS {
+                cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                ..Default::default()
+            };
+            if GetProcessMemoryInfo(
+                process,
+                &mut counters,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+            .is_ok()
+            {
+                self.shared.stats.working_set_mb.store(
+                    (counters.WorkingSetSize / (1024 * 1024)) as u32,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        self.last_metrics_sample = Instant::now();
+    }
+
     fn hide_overlay(&mut self) {
         if self.overlay.is_visible() {
             self.overlay.show(false);
         }
     }
 
+    fn discard_wgc(&mut self) {
+        self.set_stage(STAGE_WGC_DISCARD);
+        self.wgc_hwnd = None;
+        self.wgc_monitor = None;
+        self.pending_target_size = None;
+        self.wgc_target_size = None;
+        if let Some(capture) = self.wgc.take() {
+            capture.dispose_async();
+        }
+    }
+
     fn invalidate_capture(&mut self) {
         self.dup = None;
-        self.wgc = None;
-        self.wgc_target_size = None;
+        self.discard_wgc();
         self.dirty = true;
         self.has_frame = false;
     }
 
+    fn reset_for_target_change(&mut self) {
+        self.discard_wgc();
+        self.has_frame = false;
+        self.dirty = true;
+        self.last_capture_qpc = 0;
+        self.capture_interval_us = 1_000_000.0 / 60.0;
+        self.pending_window = None;
+        self.hide_overlay();
+    }
+
+    fn wait_for_capture_target(&mut self) -> Result<(), TickErr> {
+        self.invalidate_capture();
+        self.hide_overlay();
+        self.next_tick = None;
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(())
+    }
+
+    fn window_blacklisted(&self, hwnd: HWND) -> bool {
+        self.failed_window.is_some_and(|(failed, since)| {
+            failed == hwnd && since.elapsed() < Duration::from_secs(15)
+        })
+    }
+
+    fn mark_window_failed(&mut self, hwnd: HWND) {
+        self.failed_window = Some((hwnd, Instant::now()));
+    }
+
+    fn mark_current_wgc_failed(&mut self) {
+        if let Some(hwnd) = self.wgc_hwnd {
+            self.mark_window_failed(HWND(hwnd as *mut core::ffi::c_void));
+        }
+        if self.wgc_monitor.is_some() {
+            self.monitor_wgc_disabled = true;
+        }
+        self.fallback_grace_until = Some(Instant::now() + Duration::from_millis(650));
+        if matches!(self.request, CaptureRequest::Foreground { .. }) {
+            self.current_window = None;
+            self.pending_window = None;
+            self.reset_for_target_change();
+        } else {
+            self.discard_wgc();
+            self.has_frame = false;
+            self.dirty = true;
+            self.hide_overlay();
+        }
+    }
+
+    fn select_foreground_window(&mut self) -> Option<HWND> {
+        if self
+            .failed_window
+            .is_some_and(|(_, since)| since.elapsed() >= Duration::from_secs(15))
+        {
+            self.failed_window = None;
+        }
+        let candidate = fluid_capture::external_foreground_window()
+            .or_else(fluid_capture::last_external_foreground_window)
+            .filter(|hwnd| {
+                is_foreground_capture_candidate(*hwnd) && !self.window_blacklisted(*hwnd)
+            });
+        if let Some(current) = self.current_window {
+            if !is_foreground_capture_candidate(current) || self.window_blacklisted(current) {
+                tracing::info!("foreground capture target is no longer capturable");
+                self.current_window = None;
+                self.pending_window = None;
+                self.fallback_grace_until = Some(Instant::now() + Duration::from_millis(650));
+                self.reset_for_target_change();
+            }
+        }
+        let Some(candidate) = candidate else {
+            self.pending_window = None;
+            return self.current_window;
+        };
+        if self.current_window == Some(candidate) {
+            self.pending_window = None;
+            return self.current_window;
+        }
+        if self.current_window.is_none() {
+            tracing::info!("following foreground window 0x{:x}", candidate.0 as isize);
+            self.current_window = Some(candidate);
+            self.pending_window = None;
+            self.fallback_grace_until = None;
+            self.reset_for_target_change();
+            return self.current_window;
+        }
+        match self.pending_window {
+            Some((pending, since)) if pending == candidate => {
+                if since.elapsed() >= Duration::from_millis(260) {
+                    tracing::info!(
+                        "switching foreground capture to 0x{:x}",
+                        candidate.0 as isize
+                    );
+                    self.current_window = Some(candidate);
+                    self.pending_window = None;
+                    self.reset_for_target_change();
+                }
+            }
+            _ => self.pending_window = Some((candidate, Instant::now())),
+        }
+        self.current_window
+    }
+
     fn tick(&mut self, cfg: &AppConfig) -> Result<(), TickErr> {
+        fluid_gfx::pump_thread_messages();
+        self.shared
+            .pipeline_heartbeat
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stats
+            .pipeline_ticks
+            .fetch_add(1, Ordering::Relaxed);
+        self.set_stage(STAGE_TICK);
         if self.last_debug_log.elapsed() >= Duration::from_secs(2) {
             let generated = self.shared.stats.generated_frames.load(Ordering::Relaxed);
+            let capture_age_ms = if self.last_capture_qpc > 0 {
+                qpc_diff_us(self.last_capture_qpc, qpc_now(), self.freq) as f64 / 1000.0
+            } else {
+                0.0
+            };
             tracing::debug!(
-                "pipeline stats: cap={:.1} out={:.1} gpu={:.2}ms fg={} generated_delta={} dirty={}",
+                "pipeline stats: cap={:.1} out={:.1} refresh={:.1}Hz backend={} gpu={:.2}ms latency={:.1}ms capture_age={:.1}ms wait={:.2}ms present={:.2}ms render={:.2}ms fg={} generated_delta={} frames={} ticks={} acq={:.2}ms dirty={}",
                 self.shared.stats.capture_fps(),
                 self.shared.stats.present_fps(),
+                self.shared.stats.refresh_hz_x100.load(Ordering::Relaxed) as f64 / 100.0,
+                self.shared.stats.capture_backend.load(Ordering::Relaxed),
                 self.shared.stats.gpu_ms(),
+                self.shared.stats.pipeline_latency_ms(),
+                capture_age_ms,
+                self.shared.stats.present_wait_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                self.shared.stats.present_call_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                self.shared.stats.render_call_us.load(Ordering::Relaxed) as f64 / 1000.0,
                 self.shared.stats.fg_active(),
                 generated.saturating_sub(self.last_debug_generated),
+                self.shared.stats.frame_index.load(Ordering::Relaxed),
+                self.shared.stats.pipeline_ticks.load(Ordering::Relaxed),
+                self.shared.stats.acquire_call_us.load(Ordering::Relaxed) as f64 / 1000.0,
                 self.dirty
             );
             self.last_debug_generated = generated;
             self.last_debug_log = Instant::now();
+            if self.shared.stats.fg_active() {
+                let cap = self.shared.stats.capture_fps();
+                let out = self.shared.stats.present_fps();
+                let refresh =
+                    self.shared.stats.refresh_hz_x100.load(Ordering::Relaxed) as f64 / 100.0;
+                let requested = cfg.fg.max_multiplier.clamp(2, 8) as f64;
+                let target = (cap * requested).min(refresh.max(1.0));
+                if cap > 5.0 && target > cap * 1.35 && out < target * 0.85 {
+                    self.fg_underperf_count = self.fg_underperf_count.saturating_add(1);
+                } else {
+                    self.fg_underperf_count = 0;
+                }
+                if self.fg_underperf_count >= 2
+                    && self
+                        .fg_perf_until
+                        .is_none_or(|until| Instant::now() >= until)
+                {
+                    self.fg_perf_until = Some(Instant::now() + Duration::from_secs(10));
+                    self.fg_underperf_count = 0;
+                    tracing::warn!(
+                        "frame generation performance fallback enabled: disabling motion search and sharpening temporarily to approach the refresh-rate target"
+                    );
+                }
+                if cap > 5.0 && out > 0.0 && out / cap < 1.15 {
+                    self.fg_low_gain_count = self.fg_low_gain_count.saturating_add(1);
+                } else {
+                    self.fg_low_gain_count = 0;
+                }
+                if self.fg_low_gain_count >= 3 {
+                    self.fg_backoff_until = Some(Instant::now() + Duration::from_secs(5));
+                    self.fg_low_gain_count = 0;
+                    tracing::warn!(
+                        "frame generation paused for 5s: output is not increasing enough to justify its GPU cost"
+                    );
+                }
+            } else {
+                self.fg_underperf_count = 0;
+                self.fg_low_gain_count = 0;
+            }
+            let perf_active = self
+                .fg_perf_until
+                .is_some_and(|until| Instant::now() < until);
+            self.shared
+                .stats
+                .fg_perf_fallback
+                .store(u32::from(perf_active), Ordering::Relaxed);
         }
 
-        let (target_rect, source_monitor, use_wgc) = match self.request {
+        self.sample_system_metrics();
+
+        let mut active_window: Option<HWND> = None;
+        let mut fallback_monitor: Option<isize> = None;
+        match self.request {
             CaptureRequest::Monitor { hmonitor } => {
-                let hmon = HMONITOR(hmonitor as *mut core::ffi::c_void);
-                let rect = monitor_rect(hmon).ok_or_else(|| {
-                    TickErr::Fatal("selected monitor is no longer available".into())
-                })?;
-                (rect, hmonitor, false)
+                fallback_monitor = Some(hmonitor);
             }
             CaptureRequest::Window { hwnd } => {
                 let hwnd = HWND(hwnd as *mut core::ffi::c_void);
-                if !is_window(hwnd) {
-                    return Err(TickErr::Fatal("target window was closed".into()));
+                if is_window(hwnd) && !is_iconic(hwnd) && !self.window_blacklisted(hwnd) {
+                    active_window = Some(hwnd);
+                } else {
+                    // Never leave a selected-window session permanently black or
+                    // spinning on an uncapturable target. Fall back to the monitor
+                    // that contains the window (or the primary monitor).
+                    let mut monitor = monitor_of(hwnd);
+                    if monitor == 0 {
+                        monitor = enumerate_monitors()
+                            .first()
+                            .map(|m| m.hmonitor)
+                            .unwrap_or(-1);
+                    }
+                    if monitor > 0 {
+                        tracing::debug!(
+                            "selected window unavailable/uncapturable; falling back to monitor 0x{monitor:x}"
+                        );
+                        fallback_monitor = Some(monitor);
+                        self.fallback_grace_until =
+                            Some(Instant::now() + Duration::from_millis(650));
+                    } else {
+                        return self.wait_for_capture_target();
+                    }
                 }
-                if is_iconic(hwnd) {
-                    self.hide_overlay();
-                    return Ok(());
-                }
-                let Some(rect) = client_rect_on_screen(hwnd) else {
-                    self.hide_overlay();
-                    return Ok(());
-                };
-                let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
-                if w < 8 || h < 8 {
-                    self.hide_overlay();
-                    return Ok(());
-                }
-                (rect, monitor_of(hwnd), true)
             }
+            CaptureRequest::Foreground {
+                fallback_monitor: monitor,
+            } => {
+                fallback_monitor = Some(monitor);
+                self.set_stage(STAGE_SELECT);
+                active_window = self.select_foreground_window();
+            }
+        }
+
+        if active_window.is_none()
+            && self
+                .fallback_grace_until
+                .is_some_and(|until| Instant::now() < until)
+        {
+            // Opening/closing windows can briefly leave no valid foreground
+            // target. Do not immediately flash a full-monitor DDA overlay across
+            // the desktop; wait briefly for the next real window.
+            self.set_stage(STAGE_GRACE);
+            tracing::trace!("retarget grace active; hiding overlay temporarily");
+            self.hide_overlay();
+            self.has_frame = false;
+            self.next_tick = None;
+            std::thread::sleep(Duration::from_millis(80));
+            return Ok(());
+        }
+        if self
+            .fallback_grace_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            tracing::info!("retarget grace expired; allowing monitor fallback");
+            self.fallback_grace_until = None;
+        }
+
+        let (mut target_rect, source_monitor, use_wgc) = if let Some(hwnd) = active_window {
+            if !is_window(hwnd) || is_iconic(hwnd) {
+                if matches!(self.request, CaptureRequest::Foreground { .. }) {
+                    self.current_window = None;
+                    self.reset_for_target_change();
+                }
+                return self.wait_for_capture_target();
+            }
+            let Some(rect) = client_rect_on_screen(hwnd) else {
+                if matches!(self.request, CaptureRequest::Foreground { .. }) {
+                    self.current_window = None;
+                    self.reset_for_target_change();
+                }
+                return self.wait_for_capture_target();
+            };
+            let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+            if w < 16 || h < 16 {
+                return self.wait_for_capture_target();
+            }
+            (rect, monitor_of(hwnd), true)
+        } else if let Some(monitor) = fallback_monitor {
+            let hmon = HMONITOR(monitor as *mut core::ffi::c_void);
+            let Some(rect) = monitor_rect(hmon) else {
+                return Err(TickErr::Recoverable(
+                    "fallback monitor is no longer available".into(),
+                ));
+            };
+            let wgc_monitor = !self.monitor_wgc_disabled;
+            (rect, monitor, wgc_monitor)
+        } else {
+            return self.wait_for_capture_target();
         };
+
+        if !use_wgc && self.wgc.is_some() {
+            self.discard_wgc();
+            self.has_frame = false;
+            self.dirty = true;
+        }
+
+        self.shared.stats.source_id.store(
+            if use_wgc {
+                active_window
+                    .map(|hwnd| hwnd.0 as isize)
+                    .unwrap_or(source_monitor)
+            } else {
+                source_monitor
+            },
+            Ordering::Relaxed,
+        );
+        if let Some(rect) = monitor_rect(HMONITOR(source_monitor as *mut core::ffi::c_void)) {
+            self.shared
+                .stats
+                .hud_monitor_left
+                .store(rect.left, Ordering::Relaxed);
+            self.shared
+                .stats
+                .hud_monitor_top
+                .store(rect.top, Ordering::Relaxed);
+            self.shared
+                .stats
+                .hud_monitor_right
+                .store(rect.right, Ordering::Relaxed);
+            self.shared
+                .stats
+                .hud_monitor_bottom
+                .store(rect.bottom, Ordering::Relaxed);
+        }
 
         if self.refresh_checked.elapsed() > Duration::from_secs(2) {
             self.refresh_hz =
@@ -296,19 +848,58 @@ impl Session {
         }
 
         if use_wgc {
-            let hwnd = match self.request {
-                CaptureRequest::Window { hwnd } => HWND(hwnd as *mut core::ffi::c_void),
-                CaptureRequest::Monitor { .. } => {
-                    return Err(TickErr::Fatal("invalid capture backend".into()));
-                }
+            let is_monitor = matches!(self.request, CaptureRequest::Monitor { .. });
+            let target_hwnd = if is_monitor {
+                None
+            } else {
+                Some(
+                    active_window
+                        .ok_or_else(|| TickErr::Recoverable("missing WGC target window".into()))?,
+                )
             };
             let target_w = (target_rect.right - target_rect.left).max(1) as u32;
             let target_h = (target_rect.bottom - target_rect.top).max(1) as u32;
-            let need_recreate =
-                self.wgc.is_none() || self.wgc_target_size != Some((target_w, target_h));
-            if need_recreate {
-                match WgcCapture::new(&self.device_bundle.device, hwnd) {
+            let same_target = if is_monitor {
+                self.wgc_monitor == Some(source_monitor)
+            } else {
+                self.wgc_hwnd == target_hwnd.map(|hwnd| hwnd.0 as isize)
+            };
+            let size_changed = self
+                .wgc_target_size
+                .is_none_or(|(w, h)| w.abs_diff(target_w) > 2 || h.abs_diff(target_h) > 2);
+            // A window resize changes the client size on every mouse-move tick.
+            // Recreating a WinRT capture session and swapchain for each one can
+            // deadlock the Intel capture/DComp driver. Keep using the old frame
+            // pool while the window is moving, then resize it once it is stable.
+            let resize_stable = if same_target && size_changed {
+                match self.pending_target_size {
+                    Some((pending, since)) if pending == (target_w, target_h) => {
+                        since.elapsed() >= Duration::from_millis(500)
+                    }
+                    _ => {
+                        self.pending_target_size = Some(((target_w, target_h), Instant::now()));
+                        false
+                    }
+                }
+            } else {
+                self.pending_target_size = None;
+                false
+            };
+
+            if self.wgc.is_none() || !same_target {
+                self.discard_wgc();
+                self.set_stage(STAGE_WGC_NEW);
+                let created = if is_monitor {
+                    WgcCapture::new_monitor(
+                        &self.device_bundle.device,
+                        HMONITOR(source_monitor as *mut core::ffi::c_void),
+                    )
+                } else {
+                    WgcCapture::new(&self.device_bundle.device, target_hwnd.unwrap())
+                };
+                match created {
                     Ok(capture) => {
+                        self.set_stage(STAGE_RING);
                         self.renderer
                             .ensure_bgra8_ring(capture.width(), capture.height())
                             .map_err(|e| {
@@ -316,22 +907,101 @@ impl Session {
                                     "WGC frame ring allocation failed: {e}"
                                 ))
                             })?;
+                        self.wgc_target_size = Some((capture.width(), capture.height()));
                         self.wgc = Some(capture);
-                        self.wgc_target_size = Some((target_w, target_h));
+                        if is_monitor {
+                            self.wgc_monitor = Some(source_monitor);
+                            self.wgc_hwnd = None;
+                        } else {
+                            self.wgc_hwnd = target_hwnd.map(|hwnd| hwnd.0 as isize);
+                            self.wgc_monitor = None;
+                        }
                         self.monitor = source_monitor;
+                        self.failed_window = None;
+                        self.fallback_grace_until = None;
                         self.dirty = true;
                         self.has_frame = false;
                     }
                     Err(e) => {
-                        self.hide_overlay();
-                        return Err(TickErr::Recoverable(format!(
-                            "Windows Graphics Capture initialization failed: {e}. \
-                             Use full-screen capture mode if the game cannot be captured as a window."
-                        )));
+                        if is_monitor {
+                            tracing::warn!(
+                                "WGC monitor capture failed for 0x{source_monitor:x}; falling back to desktop duplication: {e}"
+                            );
+                            self.monitor_wgc_disabled = true;
+                            self.discard_wgc();
+                            self.has_frame = false;
+                            self.hide_overlay();
+                            return Ok(());
+                        }
+                        let hwnd = target_hwnd.unwrap();
+                        tracing::warn!(
+                            "WGC cannot capture window 0x{:x}; backing off for 15s: {e}",
+                            hwnd.0 as isize
+                        );
+                        self.mark_window_failed(hwnd);
+                        self.fallback_grace_until =
+                            Some(Instant::now() + Duration::from_millis(650));
+                        self.discard_wgc();
+                        self.has_frame = false;
+                        if matches!(self.request, CaptureRequest::Foreground { .. }) {
+                            self.current_window = None;
+                            self.pending_window = None;
+                            self.reset_for_target_change();
+                        } else {
+                            self.hide_overlay();
+                        }
+                        // Return successfully so the next tick can immediately fall
+                        // back to desktop duplication instead of hammering WGC.
+                        return Ok(());
+                    }
+                }
+            } else if same_target && size_changed && resize_stable {
+                self.set_stage(STAGE_RING);
+                let resized = self
+                    .wgc
+                    .as_mut()
+                    .map(|capture| capture.resize(target_w, target_h))
+                    .unwrap_or(Ok(()));
+                match resized {
+                    Ok(()) => {
+                        tracing::info!(
+                            "WGC frame pool resized after stabilization: {}x{}",
+                            target_w,
+                            target_h
+                        );
+                        self.renderer
+                            .ensure_bgra8_ring(target_w, target_h)
+                            .map_err(|e| {
+                                TickErr::Recoverable(format!("WGC frame ring resize failed: {e}"))
+                            })?;
+                        self.wgc_target_size = Some((target_w, target_h));
+                        self.pending_target_size = None;
+                        self.has_frame = false;
+                        self.dirty = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!("WGC frame pool resize failed: {e}; recreating session");
+                        if is_monitor {
+                            self.monitor_wgc_disabled = true;
+                        }
+                        self.discard_wgc();
+                        self.has_frame = false;
                     }
                 }
             }
+        } else if self
+            .dda_retry_after
+            .is_some_and(|retry| Instant::now() < retry)
+        {
+            self.hide_overlay();
+            self.next_tick = None;
+            std::thread::sleep(Duration::from_millis(100));
+            return Ok(());
         } else if self.dup.is_none() || source_monitor != self.monitor {
+            tracing::debug!(
+                "initializing Desktop Duplication fallback for monitor 0x{source_monitor:x}"
+            );
+            self.set_stage(STAGE_DDA_NEW);
             match Duplication::new_for_monitor(
                 &self.device_bundle.device,
                 HMONITOR(source_monitor as *mut core::ffi::c_void),
@@ -343,14 +1013,18 @@ impl Session {
                     })?;
                     self.dup = Some(d);
                     self.monitor = source_monitor;
+                    self.dda_retry_after = None;
+                    self.fallback_grace_until = None;
                     self.dirty = true;
                     self.has_frame = false;
                 }
                 Err(e) => {
+                    tracing::warn!(
+                        "desktop duplication initialization failed; retrying in 2s: {e}"
+                    );
+                    self.dda_retry_after = Some(Instant::now() + Duration::from_secs(2));
                     self.hide_overlay();
-                    return Err(TickErr::Recoverable(format!(
-                        "desktop duplication initialization failed: {e}"
-                    )));
+                    return Ok(());
                 }
             }
         }
@@ -362,20 +1036,34 @@ impl Session {
 
         if use_wgc {
             let mut acquired_qpc = None;
+            let mut acquire_error = None;
             {
+                self.set_stage(STAGE_CAPTURE);
                 let capture = self.wgc.as_mut().unwrap();
-                match capture.acquire_latest() {
+                let acquire_started = Instant::now();
+                let acquire_result = capture.acquire_latest();
+                self.shared.stats.acquire_call_us.store(
+                    acquire_started.elapsed().as_micros().min(u32::MAX as u128) as u32,
+                    Ordering::Relaxed,
+                );
+                match acquire_result {
                     Ok(Some(frame)) => {
                         let qpc = frame.qpc;
                         self.renderer.push_frame(frame.texture, qpc);
                         acquired_qpc = Some(qpc);
                     }
                     Ok(None) => {}
-                    Err(e) => {
-                        self.wgc = None;
-                        return Err(TickErr::Recoverable(format!("WGC capture failed: {e}")));
-                    }
+                    Err(e) => acquire_error = Some(e),
                 }
+            }
+            if let Some(e) = acquire_error {
+                tracing::warn!(
+                    "WGC capture failed on hwnd 0x{:x}; switching to fallback/backoff: {e}",
+                    self.wgc_hwnd.unwrap_or(0)
+                );
+                self.mark_current_wgc_failed();
+                self.hide_overlay();
+                return Ok(());
             }
             if let Some(qpc) = acquired_qpc {
                 self.wgc.as_mut().unwrap().release_frame();
@@ -399,10 +1087,32 @@ impl Session {
                 self.last_capture_qpc = qpc;
             }
         } else {
+            self.set_stage(STAGE_CAPTURE);
             let dup = self.dup.as_mut().unwrap();
             match dup.acquire_latest() {
                 Ok(Some(frame)) => {
-                    let should_consume = frame.desktop_updated || !self.has_frame;
+                    // In DDA mode a visible overlay can feed its own presents back
+                    // into the duplicator. Those frames arrive within a few ms of
+                    // our previous overlay present and otherwise create a full-rate
+                    // feedback loop and high GPU/CPU load. Ignore them once the
+                    // capture has a real frame; genuine source frames arrive later
+                    // in the display interval.
+                    let self_generated = self.has_frame
+                        && self.overlay.is_visible()
+                        && self.last_present_qpc > 0
+                        && frame.qpc > 0
+                        && {
+                            let freq = self.freq.max(1) as i128;
+                            let delta_us = (frame.qpc as i128 - self.last_present_qpc as i128)
+                                * 1_000_000
+                                / freq;
+                            delta_us < 10_000
+                        };
+                    let should_consume =
+                        (frame.desktop_updated || !self.has_frame) && !self_generated;
+                    if self_generated {
+                        tracing::trace!("ignored DDA update caused by the capture overlay present");
+                    }
                     if should_consume {
                         let qpc = frame.qpc;
                         if frame.accumulated > 1 {
@@ -443,15 +1153,26 @@ impl Session {
                 }
                 Ok(None) => {}
                 Err(CaptureError::AccessLost) => {
+                    tracing::warn!("desktop duplication access lost; retrying in 2s");
                     self.dup = None;
-                    return Err(TickErr::Recoverable(
-                        "desktop duplication lost, rebuilding".into(),
-                    ));
+                    self.dda_retry_after = Some(Instant::now() + Duration::from_secs(2));
+                    self.hide_overlay();
+                    return Ok(());
                 }
                 Err(e) => {
+                    tracing::warn!("desktop duplication capture failed; retrying in 2s: {e}");
                     self.dup = None;
-                    return Err(TickErr::Recoverable(format!("capture failed: {e}")));
+                    self.dda_retry_after = Some(Instant::now() + Duration::from_secs(2));
+                    self.hide_overlay();
+                    return Ok(());
                 }
+            }
+        }
+
+        if use_wgc {
+            if let Some((captured_w, captured_h)) = self.wgc_target_size {
+                target_rect.right = target_rect.left + captured_w as i32;
+                target_rect.bottom = target_rect.top + captured_h as i32;
             }
         }
 
@@ -470,7 +1191,46 @@ impl Session {
             output_rect.bottom,
         );
         let rect_changed = self.last_output_rect != Some(output_key);
+        self.shared.stats.source_width.store(
+            (target_rect.right - target_rect.left).max(1) as u32,
+            Ordering::Relaxed,
+        );
+        self.shared.stats.source_height.store(
+            (target_rect.bottom - target_rect.top).max(1) as u32,
+            Ordering::Relaxed,
+        );
+        self.shared.stats.output_width.store(
+            (output_rect.right - output_rect.left).max(1) as u32,
+            Ordering::Relaxed,
+        );
+        self.shared.stats.output_height.store(
+            (output_rect.bottom - output_rect.top).max(1) as u32,
+            Ordering::Relaxed,
+        );
+        self.shared
+            .stats
+            .refresh_hz_x100
+            .store((self.refresh_hz.max(1.0) * 100.0) as u32, Ordering::Relaxed);
+        let backend_code = if use_wgc {
+            if matches!(self.request, CaptureRequest::Monitor { .. }) {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        self.shared
+            .stats
+            .capture_backend
+            .store(backend_code, Ordering::Relaxed);
 
+        let keep_below_taskbar = matches!(self.request, CaptureRequest::Monitor { .. });
+        if keep_below_taskbar != self.keep_overlay_below_taskbar {
+            self.overlay.set_keep_below_taskbar(keep_below_taskbar);
+            self.keep_overlay_below_taskbar = keep_below_taskbar;
+        }
+        self.set_stage(STAGE_OVERLAY_PLACE);
         self.overlay
             .place(&output_rect)
             .map_err(|e| TickErr::Recoverable(format!("overlay placement failed: {e}")))?;
@@ -482,10 +1242,8 @@ impl Session {
         // Always pace the loop before deciding whether to render. Without this,
         // skipping unchanged frames would spin the CPU at full speed.
         if let Some(next) = self.next_tick {
-            let now = Instant::now();
-            if now < next {
-                std::thread::sleep((next - now).saturating_sub(Duration::from_millis(1)));
-            }
+            self.set_stage(STAGE_PACE);
+            sleep_until(next);
         }
 
         let latest_now = self.renderer.latest_snapshot();
@@ -500,9 +1258,10 @@ impl Session {
         let stall_limit_ticks = (expected_interval_ticks * 2).max((self.freq as f64 * 0.05) as i64);
         let source_stalled = source_age_ticks > stall_limit_ticks;
         let enough_frames = latest_now.as_ref().is_some_and(|frame| frame.seq >= 2);
-        if latest_now.is_none() {
+        if !self.has_frame || latest_now.is_none() {
             // WGC can legitimately be silent until the target window presents a
-            // new frame. Wait without tearing down the capture session.
+            // new frame, and switching targets discards the old frame snapshot.
+            // Wait without tearing down the capture session.
             self.hide_overlay();
             self.next_tick = Some(Instant::now() + frame_period);
             return Ok(());
@@ -514,12 +1273,14 @@ impl Session {
             && cfg.fg.max_multiplier >= 2
             && capture_ratio >= 1.35
             && enough_frames
-            && !source_stalled;
+            && !source_stalled
+            && self
+                .fg_backoff_until
+                .is_none_or(|until| Instant::now() >= until);
         self.shared
             .stats
             .fg_active
             .store(u32::from(fg_eligible), Ordering::Relaxed);
-
         // If nothing changed and no interpolated output is due, keep the last
         // presented swapchain image. This avoids pointless GPU work on a static
         // source and when interpolation is disabled.
@@ -531,27 +1292,29 @@ impl Session {
         // Generated frames are capped relative to source FPS. This avoids
         // spending 144 Hz worth of GPU work on a 45 FPS source unless the user
         // explicitly raises the multiplier.
-        if fg_eligible && !got_new && !self.dirty && !rect_changed {
-            let multiplier = cfg.fg.max_multiplier.clamp(2, 8) as f64;
-            let desired_period =
-                Duration::from_secs_f64((self.capture_interval_us * 1.0e-6) / multiplier);
-            let minimum_period = frame_period.max(desired_period);
-            let since_present = self
-                .last_present_tick
-                .map_or(minimum_period, |last| last.elapsed());
-            if since_present < minimum_period.saturating_sub(Duration::from_millis(1)) {
-                self.next_tick = Some(Instant::now() + frame_period);
-                return Ok(());
-            }
-        }
-
         let rtv = match self.overlay.rtv() {
             Some(r) => r.clone(),
             None => return Err(TickErr::Recoverable("swapchain RTV unavailable".into())),
         };
 
-        self.overlay.wait_present_slot(200);
-        let t0 = Instant::now();
+        // TEMP diagnostic: rely on Present backpressure instead of the waitable.
+        let present_slot_ready = true;
+        let waited_us = 0u32;
+        self.shared
+            .stats
+            .present_wait_us
+            .store(0, Ordering::Relaxed);
+        if !present_slot_ready {
+            tracing::debug!("present slot wait timed out after {waited_us}us");
+            if self.shared.stats.frame_index.load(Ordering::Relaxed) > 0 {
+                self.shared
+                    .stats
+                    .dropped_frames
+                    .fetch_add(1, Ordering::Relaxed);
+                self.next_tick = Some(Instant::now() + Duration::from_millis(1));
+                return Ok(());
+            }
+        }
         let now_qpc = qpc_now();
 
         let latest =
@@ -573,6 +1336,11 @@ impl Session {
             (latest.clone(), latest)
         };
 
+        self.shared.stats.fg_phase_x1000.store(
+            (fg_phase.clamp(0.0, 1.0) * 1000.0) as u32,
+            Ordering::Relaxed,
+        );
+
         let previous = &previous;
         let current = &current;
         let interpolating =
@@ -583,49 +1351,37 @@ impl Session {
                 .generated_frames
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let scale_mode = match cfg.scale.mode {
-            ScaleMode::Passthrough => 0,
-            ScaleMode::Bilinear => 1,
-            ScaleMode::Adaptive => 2,
+        let perf_fallback = self
+            .fg_perf_until
+            .is_some_and(|until| Instant::now() < until);
+        let scale_mode = if perf_fallback {
+            1
+        } else {
+            match cfg.scale.mode {
+                ScaleMode::Passthrough => 0,
+                ScaleMode::Bilinear => 1,
+                ScaleMode::Adaptive => 2,
+            }
         };
         let options = RenderOptions {
             scale_mode,
-            sharpness: cfg.scale.sharpness.min(100) as f32 / 100.0,
+            sharpness: if perf_fallback {
+                0.0
+            } else {
+                cfg.scale.sharpness.min(100) as f32 / 100.0
+            },
             fg_enabled: fg_eligible,
-            motion_compensation: cfg.fg.motion_compensation,
+            motion_compensation: cfg.fg.motion_compensation && !perf_fallback,
             preserve_aspect: cfg.scale.preserve_aspect,
             fg_strength: cfg.fg.strength.min(100) as f32 / 100.0,
             scene_protection: cfg.fg.scene_protection.min(100) as f32 / 100.0,
             fg_phase,
         };
 
-        let hud_text = if cfg.display.show_hud {
-            let fg_label = if interpolating {
-                "fg:interp"
-            } else if fg_eligible {
-                "fg:ready"
-            } else if cfg.fg.enabled {
-                "fg:idle"
-            } else {
-                "fg:off"
-            };
-            let source_label = match self.request {
-                CaptureRequest::Monitor { .. } => "monitor",
-                CaptureRequest::Window { .. } => "window",
-            };
-            Some(format!(
-                "fluid v{ver} | {source_label} | cap {cap:.0} | out {pres:.0} fps | gpu {gpu:.2} ms | lat {lat:.1} ms | {fg_label}",
-                ver = env!("CARGO_PKG_VERSION"),
-                source_label = source_label,
-                cap = self.shared.stats.capture_fps(),
-                pres = self.shared.stats.present_fps(),
-                gpu = self.shared.stats.gpu_ms(),
-                lat = self.shared.stats.pipeline_latency_ms(),
-                fg_label = fg_label,
-            ))
-        } else {
-            None
-        };
+        // The real-time HUD is now a separate lightweight window. The capture
+        // overlay no longer draws any HUD content.
+        let hud_options = HudOptions::default();
+        let hud_text: Option<&str> = None;
 
         let sync = match cfg.display.present_mode {
             PresentMode::LowLatency => 0,
@@ -637,26 +1393,56 @@ impl Session {
             let output_rect_desc = self.dup.as_ref().unwrap().output_rect();
             uv_rect(&output_rect_desc, &target_rect)
         };
+        if !self.overlay.is_visible() {
+            self.overlay.show(true);
+        }
         let (bbw, bbh) = self.overlay.size();
-        self.renderer
-            .render(RenderRequest {
-                target: RenderTargetInfo {
-                    rtv: &rtv,
-                    width: bbw,
-                    height: bbh,
-                    uv_rect: uv,
-                },
-                previous,
-                current,
-                options,
-                hud_text: hud_text.as_deref(),
-            })
-            .map_err(|e| TickErr::Recoverable(format!("render failed: {e}")))?;
+        self.set_stage(STAGE_RENDER);
+        let workload_started = Instant::now();
+        let render_started = Instant::now();
+        let render_result = self.renderer.render(RenderRequest {
+            target: RenderTargetInfo {
+                rtv: &rtv,
+                width: bbw,
+                height: bbh,
+                uv_rect: uv,
+            },
+            previous,
+            current,
+            options,
+            hud_text,
+            hud: hud_options,
+        });
+        self.shared.stats.render_call_us.store(
+            render_started.elapsed().as_micros().min(u32::MAX as u128) as u32,
+            Ordering::Relaxed,
+        );
+        render_result.map_err(|e| TickErr::Recoverable(format!("render failed: {e}")))?;
+        self.set_stage(STAGE_PRESENT);
+        let present_started = Instant::now();
         self.overlay.present(sync);
+        self.shared.stats.present_call_us.store(
+            present_started.elapsed().as_micros().min(u32::MAX as u128) as u32,
+            Ordering::Relaxed,
+        );
         self.last_present_qpc = qpc_now();
         self.dirty = false;
 
-        self.next_tick = Some(t0 + frame_period);
+        let workload = workload_started.elapsed();
+        let overload_limit = frame_period.saturating_mul(2);
+        if fg_eligible && workload > overload_limit {
+            self.overload_count = self.overload_count.saturating_add(1);
+        } else if workload < frame_period {
+            self.overload_count = self.overload_count.saturating_sub(1);
+        }
+        if self.overload_count >= 45 {
+            self.fg_backoff_until = Some(Instant::now() + Duration::from_secs(5));
+            self.overload_count = 0;
+            tracing::warn!(
+                "frame generation paused for 5s: GPU cannot sustain the requested output rate"
+            );
+        }
+
         self.shared
             .stats
             .frame_index
@@ -675,6 +1461,19 @@ impl Session {
             );
         }
         self.last_present_tick = Some(now_instant);
+        let next_period = if fg_eligible {
+            let multiplier = cfg.fg.max_multiplier.clamp(2, 8) as f64;
+            let desired = Duration::from_secs_f64((self.capture_interval_us * 1.0e-6) / multiplier);
+            frame_period.max(desired)
+        } else {
+            frame_period
+        };
+        let cadence_base = self.next_tick.unwrap_or(now_instant);
+        let mut next = cadence_base + next_period;
+        if next < now_instant {
+            next = now_instant + next_period;
+        }
+        self.next_tick = Some(next);
         Stats::ema_x100(
             &self.shared.stats.gpu_us,
             self.renderer.gpu_us() as f64,
@@ -690,8 +1489,18 @@ impl Session {
         };
         if effective_qpc > 0.0 {
             let lat_us = ((now_qpc as f64 - effective_qpc) / self.freq as f64 * 1e6).max(0.0);
-            Stats::ema_x100(&self.shared.stats.pipeline_latency_us, lat_us, 0.1);
+            self.shared
+                .stats
+                .pipeline_latency_us
+                .store(lat_us.min(u32::MAX as f64) as u32, Ordering::Relaxed);
+            tracing::trace!("pipeline effective frame age: {:.2}ms", lat_us / 1000.0);
         }
         Ok(())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.discard_wgc();
     }
 }

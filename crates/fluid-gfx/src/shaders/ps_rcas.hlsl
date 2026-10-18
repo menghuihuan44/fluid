@@ -42,8 +42,13 @@ float4 main(PSIn i) : SV_Target {
     // RCAS-like local contrast adaptation: high-contrast edges receive less
     // boost than soft texture detail, reducing halos and shimmering.
     float local_contrast = luminance(hi) - luminance(lo);
-    float adaptive = amount * lerp(1.25, 0.65, saturate(local_contrast * 4.0));
-    float3 sharpened = c + (c - blur) * adaptive;
+    float adaptive = amount * lerp(1.0, 0.45, saturate(local_contrast * 4.0));
+    // Sharpen luminance only; applying the same boost to R/G/B independently
+    // creates colour fringes on high-contrast text and game UI.
+    float luma_c = luminance(c);
+    float luma_blur = luminance(blur);
+    float luma_sharp = luma_c + (luma_c - luma_blur) * adaptive;
+    float3 sharpened = c + (luma_sharp - luma_c);
     sharpened = clamp(sharpened, lo, hi);
     return float4(sharpened, 1.0);
 }

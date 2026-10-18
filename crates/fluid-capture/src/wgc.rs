@@ -1,4 +1,4 @@
-﻿//! Windows Graphics Capture (WGC) backend for per-window capture.
+//! Windows Graphics Capture (WGC) backend for per-window capture.
 //!
 //! Capturing a single HWND avoids Desktop Duplication's feedback loop: the
 //! fluid overlay is a separate top-level window, so presenting it does not
@@ -6,6 +6,8 @@
 
 use crate::clock::qpc_now;
 use crate::duplication::CaptureError;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, OnceLock};
 use windows::core::{factory, Interface};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
@@ -16,6 +18,7 @@ use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
@@ -23,11 +26,13 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 
 pub struct WgcCapture {
-    _item: GraphicsCaptureItem,
-    frame_pool: Direct3D11CaptureFramePool,
-    session: GraphicsCaptureSession,
+    // Put frame/texture before the session/pool so explicit Close() calls from
+    // drop cannot block the pipeline when the target window disappears.
     frame: Option<Direct3D11CaptureFrame>,
     texture: Option<ID3D11Texture2D>,
+    _session: GraphicsCaptureSession,
+    frame_pool: Direct3D11CaptureFramePool,
+    direct3d_device: IDirect3DDevice,
     width: u32,
     height: u32,
 }
@@ -37,28 +42,78 @@ pub struct WgcFrame<'a> {
     pub qpc: i64,
 }
 
+// WGC was created with Direct3D11CaptureFramePool::CreateFreeThreaded and the
+// pipeline COM apartment is MTA. Disposing the COM references from a cleanup
+// thread is safe and prevents a dead target from blocking the render thread.
+unsafe impl Send for WgcCapture {}
+
+static WGC_CLEANUP_TX: OnceLock<mpsc::Sender<WgcCapture>> = OnceLock::new();
+static WGC_CLEANUP_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+fn cleanup_sender() -> Option<&'static mpsc::Sender<WgcCapture>> {
+    if let Some(tx) = WGC_CLEANUP_TX.get() {
+        return Some(tx);
+    }
+    let (tx, rx) = mpsc::channel::<WgcCapture>();
+    let builder = std::thread::Builder::new().name("fluid-wgc-cleanup".into());
+    if let Err(e) = builder.spawn(move || {
+        // Serialize WinRT/D3D teardown and give the pipeline a short head start
+        // on the new target before releasing the previous capture objects.
+        while let Ok(capture) = rx.recv() {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(capture);
+            WGC_CLEANUP_PENDING.fetch_sub(1, Ordering::Relaxed);
+        }
+    }) {
+        tracing::warn!("failed to start WGC cleanup worker: {e}");
+        return None;
+    }
+    let _ = WGC_CLEANUP_TX.set(tx);
+    WGC_CLEANUP_TX.get()
+}
+
 impl WgcCapture {
-    pub fn new(device: &ID3D11Device, hwnd: HWND) -> Result<Self, CaptureError> {
+    pub fn dispose_async(self) {
+        let Some(tx) = cleanup_sender() else {
+            drop(self);
+            return;
+        };
+        WGC_CLEANUP_PENDING.fetch_add(1, Ordering::Relaxed);
+        if tx.send(self).is_err() {
+            WGC_CLEANUP_PENDING.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        let pending = WGC_CLEANUP_PENDING.load(Ordering::Relaxed);
+        if pending == 8 || pending == 32 {
+            tracing::warn!("WGC cleanup queue is backing up: pending={pending}");
+        }
+    }
+}
+
+pub fn wgc_cleanup_pending() -> usize {
+    WGC_CLEANUP_PENDING.load(Ordering::Relaxed)
+}
+
+impl WgcCapture {
+    fn prepare_device(device: &ID3D11Device) -> Result<IDirect3DDevice, CaptureError> {
         unsafe {
-            // The pipeline thread already initializes COM as MTA. RoInitialize
-            // returns S_FALSE when the apartment is already initialized, which
-            // windows-rs treats as success.
             RoInitialize(RO_INIT_MULTITHREADED)?;
         }
-
         if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
             return Err(CaptureError::Other(
                 "Windows Graphics Capture is not supported on this system".into(),
             ));
         }
-
         let dxgi_device: IDXGIDevice = device.cast()?;
         let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)? };
-        let direct3d_device: IDirect3DDevice = inspectable.cast()?;
+        Ok(inspectable.cast()?)
+    }
 
-        let interop: IGraphicsCaptureItemInterop =
-            factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
+    fn from_item(
+        direct3d_device: IDirect3DDevice,
+        item: GraphicsCaptureItem,
+        label: &str,
+    ) -> Result<Self, CaptureError> {
         let size = item.Size()?;
         if size.Width <= 0 || size.Height <= 0 {
             return Err(CaptureError::Other("capture item has an empty size".into()));
@@ -79,21 +134,56 @@ impl WgcCapture {
         }
         session.StartCapture()?;
         tracing::info!(
-            "Windows Graphics Capture ready: {}x{} hwnd={:?}",
+            "Windows Graphics Capture ready: {}x{} {}",
             size.Width,
             size.Height,
-            hwnd
+            label
         );
 
         Ok(Self {
-            _item: item,
-            frame_pool,
-            session,
             frame: None,
             texture: None,
+            _session: session,
+            frame_pool,
+            direct3d_device,
             width: size.Width as u32,
             height: size.Height as u32,
         })
+    }
+
+    pub fn new(device: &ID3D11Device, hwnd: HWND) -> Result<Self, CaptureError> {
+        let direct3d_device = Self::prepare_device(device)?;
+        let interop: IGraphicsCaptureItemInterop =
+            factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
+        Self::from_item(direct3d_device, item, &format!("hwnd={hwnd:?}"))
+    }
+
+    pub fn new_monitor(device: &ID3D11Device, monitor: HMONITOR) -> Result<Self, CaptureError> {
+        let direct3d_device = Self::prepare_device(device)?;
+        let interop: IGraphicsCaptureItemInterop =
+            factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor)? };
+        Self::from_item(direct3d_device, item, &format!("monitor={monitor:?}"))
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), CaptureError> {
+        if width == 0 || height == 0 {
+            return Err(CaptureError::Other("cannot resize WGC to zero".into()));
+        }
+        self.release_frame();
+        self.frame_pool.Recreate(
+            &self.direct3d_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            SizeInt32 {
+                Width: width as i32,
+                Height: height as i32,
+            },
+        )?;
+        self.width = width;
+        self.height = height;
+        Ok(())
     }
 
     pub fn width(&self) -> u32 {
@@ -118,7 +208,7 @@ impl WgcCapture {
             Height: self.height as i32,
         });
         if content.Width <= 0 || content.Height <= 0 {
-            let _ = frame.Close();
+            drop(frame);
             return Ok(None);
         }
         self.width = content.Width as u32;
@@ -136,17 +226,24 @@ impl WgcCapture {
     }
 
     pub fn release_frame(&mut self) {
+        // Do not call Close() while polling. A target can disappear between
+        // TryGetNextFrame and release; synchronous WinRT teardown can then block
+        // the pipeline indefinitely. Dropping the COM reference is non-blocking.
         self.texture = None;
-        if let Some(frame) = self.frame.take() {
-            let _ = frame.Close();
-        }
+        self.frame = None;
     }
 }
 
 impl Drop for WgcCapture {
     fn drop(&mut self) {
-        self.release_frame();
-        let _ = self.session.Close();
+        // This Drop runs on the dedicated cleanup worker, never on the pipeline
+        // thread. Explicit Close() is needed to tear down the WinRT capture
+        // session worker; if it blocks, the pipeline remains responsive.
+        self.texture = None;
+        self.frame = None;
+        tracing::debug!("WGC cleanup: closing capture session");
+        let _ = self._session.Close();
         let _ = self.frame_pool.Close();
+        tracing::debug!("WGC cleanup: capture session closed");
     }
 }

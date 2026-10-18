@@ -14,7 +14,7 @@ use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    GA_ROOT, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    GA_ROOT, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 #[derive(Debug, Clone)]
@@ -125,6 +125,62 @@ pub fn client_rect_on_screen(hwnd: HWND) -> Option<RECT> {
     })
 }
 
+/// A conservative predicate for following the foreground window. Desktop
+/// shell windows and tiny transient popups are not useful capture targets.
+pub fn is_capturable_window(hwnd: HWND) -> bool {
+    if !is_window(hwnd) || is_iconic(hwnd) || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return false;
+    }
+    if is_own_process_window(hwnd) || is_cloaked(hwnd) {
+        return false;
+    }
+    if unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd {
+        return false;
+    }
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
+        return false;
+    }
+    if ex_style & WS_EX_TOOLWINDOW.0 != 0 && window_title(hwnd).is_empty() {
+        return false;
+    }
+    let class = window_class(hwnd);
+    if matches!(
+        class.as_str(),
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    ) {
+        return false;
+    }
+    let Some(rect) = window_bounds(hwnd) else {
+        return false;
+    };
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    width >= 160 && height >= 120
+}
+
+/// A permissive foreground-candidate check used for game/video windows.
+/// Exclusive-fullscreen games can report unusual styles or `IsWindowVisible`
+/// false, so the stricter enumeration filter is intentionally not used here.
+pub fn is_foreground_capture_candidate(hwnd: HWND) -> bool {
+    if !is_window(hwnd) || is_own_process_window(hwnd) {
+        return false;
+    }
+    let class = window_class(hwnd);
+    if matches!(
+        class.as_str(),
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    ) {
+        return false;
+    }
+    let Some(rect) = window_bounds(hwnd) else {
+        return false;
+    };
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    width >= 160 && height >= 120
+}
+
 pub fn window_process_id(hwnd: HWND) -> u32 {
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
@@ -143,13 +199,13 @@ pub fn foreground_window() -> Option<HWND> {
     }
     let root = unsafe { GetAncestor(fg, GA_ROOT) };
     let target = if root.0.is_null() { fg } else { root };
-    (is_window(target) && unsafe { IsWindowVisible(target).as_bool() }).then_some(target)
+    is_window(target).then_some(target)
 }
 
 /// Build a selectable entry for one window, even when it was not produced by
 /// the regular enumeration (for example, "use last foreground window").
 pub fn window_info(hwnd: HWND) -> Option<WinEnum> {
-    if !is_window(hwnd) || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+    if !is_window(hwnd) {
         return None;
     }
     if is_own_process_window(hwnd) {

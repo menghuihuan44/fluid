@@ -72,8 +72,9 @@ pub struct DisplayConfig {
     pub show_hud: bool,
     /// Keep running in the tray when the settings window is closed.
     pub close_to_tray: bool,
-    /// Hide the settings window after starting capture to give the game the
-    /// whole foreground CPU/GPU budget.
+    /// Retained for configuration compatibility. Capture now always minimizes
+    /// the settings window, because its topmost overlay would otherwise hide the
+    /// settings UI.
     pub hide_on_start: bool,
     /// Enable Ctrl+Alt+Shift+F9 (start/stop) and Ctrl+Alt+Shift+F10 (HUD toggle).
     pub global_hotkeys: bool,
@@ -115,6 +116,64 @@ impl Default for ScaleConfig {
 
 /// Frame generation configuration. Disabled by default; the motion field is
 /// only computed when the user explicitly enables interpolation.
+/// Anchor position of the real-time monitor HUD.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HudAnchor {
+    #[default]
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    /// Normalized position inside the overlay; 0..100 on both axes.
+    Custom,
+}
+
+/// Real-time monitor HUD layout and visible sections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HudConfig {
+    pub anchor: HudAnchor,
+    /// Pixel margin from the selected edge.
+    pub margin: u8,
+    /// 0..=100 normalized X position for Custom anchor.
+    pub custom_x: u8,
+    /// 0..=100 normalized Y position for Custom anchor.
+    pub custom_y: u8,
+    /// Bitmap font scale, 1..=3.
+    pub font_scale: u8,
+    /// Legacy per-pixel background alpha, retained for config compatibility.
+    pub background_alpha: u8,
+    /// Opaque HUD panel color (sRGB).
+    pub background_color: [u8; 3],
+    /// Whole HUD window opacity, 10..=100 percent.
+    pub opacity: u8,
+    pub show_source: bool,
+    pub show_performance: bool,
+    pub show_quality: bool,
+    pub show_framegen: bool,
+    pub show_system: bool,
+}
+
+impl Default for HudConfig {
+    fn default() -> Self {
+        Self {
+            anchor: HudAnchor::TopLeft,
+            margin: 12,
+            custom_x: 50,
+            custom_y: 50,
+            font_scale: 2,
+            background_alpha: 160,
+            background_color: [10, 14, 22],
+            opacity: 90,
+            show_source: true,
+            show_performance: true,
+            show_quality: true,
+            show_framegen: true,
+            show_system: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FgConfig {
@@ -148,6 +207,7 @@ pub struct AppConfig {
     pub display: DisplayConfig,
     pub scale: ScaleConfig,
     pub fg: FgConfig,
+    pub hud: HudConfig,
 }
 
 impl AppConfig {

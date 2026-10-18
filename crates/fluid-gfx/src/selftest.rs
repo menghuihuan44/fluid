@@ -2,6 +2,7 @@
 //! 读回中心像素校验，不依赖真实 GPU 与桌面，可在 CI 运行。
 
 use crate::device::create_device_with_driver;
+use crate::hud_overlay::HudRenderer;
 use crate::renderer::Renderer;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
 use windows::Win32::Graphics::Direct3D11::{
@@ -14,16 +15,16 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 pub fn render_identity() -> Result<(), String> {
     let bundle = create_device_with_driver(None, D3D_DRIVER_TYPE_WARP)
         .map_err(|e| format!("WARP 设备创建失败: {e}"))?;
-    let (w, h) = (64u32, 64u32);
+    let (w, h) = (640u32, 400u32);
 
-    // 源纹理: R = x*4, G = y*4, B = 128（中心像素应为 128,128,128）
+    // Source gradient: R = x/w, G = y/h, B = 128; the center is ~128,128,128.
     let mut data = vec![0u8; (w * h * 4) as usize];
     for y in 0..h {
         for x in 0..w {
             let i = ((y * w + x) * 4) as usize;
             data[i] = 128;
-            data[i + 1] = (y * 4) as u8;
-            data[i + 2] = (x * 4) as u8;
+            data[i + 1] = (y * 255 / (h - 1)) as u8;
+            data[i + 2] = (x * 255 / (w - 1)) as u8;
             data[i + 3] = 255;
         }
     }
@@ -110,7 +111,8 @@ pub fn render_identity() -> Result<(), String> {
             previous: &sample,
             current: &sample,
             options: opts,
-            hud_text: None,
+            hud_text: Some("fluid HUD selftest\ncapture: WGC window\ncapture 60.0 fps | output 120.0 fps\nscale: adaptive | sharpness: 30"),
+            hud: crate::renderer::HudOptions::default(),
         })
         .map_err(|e| e.to_string())?;
 
@@ -134,8 +136,10 @@ pub fn render_identity() -> Result<(), String> {
             .map_err(|e| format!("Map 失败: {e}"))?;
         let row = mapped.RowPitch as usize;
         let bytes = std::slice::from_raw_parts(mapped.pData as *const u8, row * h as usize);
-        let p = row * 32 + 32 * 4;
+        let p = row * (h as usize / 2) + (w as usize / 2) * 4;
         let (b, g, r, a) = (bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]);
+        let hud_pixel = row * 30 + 30 * 4;
+        let hud_b = bytes[hud_pixel];
         bundle.ctx.Unmap(&st_tex, 0);
         if a != 255 {
             return Err(format!("中心像素 alpha={a}，应为 255"));
@@ -146,6 +150,11 @@ pub fn render_identity() -> Result<(), String> {
         if !ok {
             return Err(format!(
                 "中心像素异常 BGRA=({b},{g},{r},{a})，应为 (128,128,128,255)"
+            ));
+        }
+        if hud_b >= 100 {
+            return Err(format!(
+                "HUD 未覆盖左上区域：采样蓝色分量={hud_b}，预期 HUD 背景使其明显变小"
             ));
         }
     }
@@ -318,6 +327,7 @@ pub fn render_motion_interpolation() -> Result<(), String> {
             current: &curr,
             options: opts,
             hud_text: None,
+            hud: crate::renderer::HudOptions::default(),
         })
         .map_err(|e| e.to_string())?;
 
@@ -333,6 +343,80 @@ pub fn render_motion_interpolation() -> Result<(), String> {
     }
     if !any_color {
         return Err("motion test rendered a black frame".into());
+    }
+    Ok(())
+}
+
+/// Verify the independent HUD renderer can rasterize text into an RTV.
+pub fn render_hud_window() -> Result<(), String> {
+    let bundle = create_device_with_driver(None, D3D_DRIVER_TYPE_WARP)
+        .map_err(|e| format!("HUD WARP device: {e}"))?;
+    let mut renderer =
+        HudRenderer::new(&bundle.device, &bundle.ctx).map_err(|e| format!("HUD renderer: {e}"))?;
+    let text = "fluid HUD selftest\ncapture: WGC window\ncapture 60.0 fps | output 120.0 fps\nscale: adaptive | sharpness: 30\nframe gen: on | state: interpolating";
+    let bg = [20u8, 80, 160];
+    let (w, h) = renderer.update_text(text, 2, bg);
+    if w < 128 || h < 64 {
+        return Err(format!("HUD size too small: {w}x{h}"));
+    }
+    let rt_desc = D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut rt = None;
+    unsafe { bundle.device.CreateTexture2D(&rt_desc, None, Some(&mut rt)) }
+        .map_err(|e| format!("HUD RT creation: {e}"))?;
+    let rt = rt.unwrap();
+    let mut rtv = None;
+    unsafe {
+        bundle
+            .device
+            .CreateRenderTargetView(&rt, None, Some(&mut rtv))
+    }
+    .map_err(|e| format!("HUD RTV creation: {e}"))?;
+    renderer
+        .draw(&rtv.unwrap(), w, h)
+        .map_err(|e| format!("HUD draw: {e}"))?;
+    let pixels = read_back(&bundle.device, &bundle.ctx, &rt, w, h)?;
+    let bg_pixel = 4 * (w as usize) + 4;
+    let (b, g, r, a) = (
+        pixels[bg_pixel * 4],
+        pixels[bg_pixel * 4 + 1],
+        pixels[bg_pixel * 4 + 2],
+        pixels[bg_pixel * 4 + 3],
+    );
+    if a != 255
+        || (b as i32 - bg[2] as i32).abs() > 3
+        || (g as i32 - bg[1] as i32).abs() > 3
+        || (r as i32 - bg[0] as i32).abs() > 3
+    {
+        return Err(format!(
+            "HUD background color mismatch BGRA=({b},{g},{r},{a}), expected ({},{},{},255)",
+            bg[2], bg[1], bg[0]
+        ));
+    }
+    let mut bright = 0usize;
+    for px in pixels.as_chunks::<4>().0 {
+        if px[3] != 255 {
+            return Err(format!("HUD produced alpha={}", px[3]));
+        }
+        if px[0] > 150 && px[1] > 150 && px[2] > 150 {
+            bright += 1;
+        }
+    }
+    if bright < 20 {
+        return Err(format!("HUD text was not visible (bright pixels={bright})"));
     }
     Ok(())
 }
