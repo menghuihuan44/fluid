@@ -358,6 +358,7 @@ fn build_hud_text(cfg: &AppConfig, shared: &SharedState) -> String {
     } else {
         1.0
     };
+    let target_multiplier = stats.fg_target_multiplier_x100.load(Ordering::Relaxed) as f64 / 100.0;
     let process_cpu = stats.process_cpu_percent();
     let working_set = stats.working_set_mb();
     let frame_index = stats.frame_index.load(Ordering::Relaxed);
@@ -391,8 +392,12 @@ fn build_hud_text(cfg: &AppConfig, shared: &SharedState) -> String {
             stats.dropped_frames.load(Ordering::Relaxed)
         ));
         lines.push(format!(
-            "generated {generated_fps:.1} fps | effective {effective_multiplier:.1}x | total {}",
-            stats.generated_frames.load(Ordering::Relaxed)
+            "generated {generated_fps:.1} fps | target {target_multiplier:.1}x | effective {effective_multiplier:.1}x"
+        ));
+        lines.push(format!(
+            "generated total {} | output frames {}",
+            stats.generated_frames.load(Ordering::Relaxed),
+            stats.frame_index.load(Ordering::Relaxed)
         ));
     }
     if cfg.hud.show_quality {

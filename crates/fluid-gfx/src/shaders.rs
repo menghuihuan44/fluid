@@ -1,4 +1,4 @@
-﻿//! HLSL 源码内嵌 + 启动时经系统 d3dcompiler_47 编译（Windows 8.1+ 自带）。
+//! HLSL 源码内嵌 + 启动时经系统 d3dcompiler_47 编译（Windows 8.1+ 自带）。
 //! 编译一次约几毫秒，免去构建期工具链依赖。
 
 use crate::error::GfxError;
@@ -7,18 +7,22 @@ use windows::core::PCSTR;
 use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
 
 pub const VS_FULLSCREEN: &str = include_str!("shaders/vs_fullscreen.hlsl");
-pub const PS_COMPOSE: &str = include_str!("shaders/ps_compose.hlsl");
+pub const PS_BLEND: &str = include_str!("shaders/ps_blend.hlsl");
+pub const PS_UPSCALE: &str = include_str!("shaders/ps_upscale.hlsl");
 pub const PS_RCAS: &str = include_str!("shaders/ps_rcas.hlsl");
 pub const PS_HUD: &str = include_str!("shaders/ps_hud.hlsl");
 pub const CS_FLOW: &str = include_str!("shaders/cs_flow.hlsl");
+pub const CS_FLOW_SMOOTH: &str = include_str!("shaders/cs_flow_smooth.hlsl");
 
 #[derive(Clone)]
 pub struct ShaderBinaries {
     pub vs: Vec<u8>,
-    pub ps_compose: Vec<u8>,
+    pub ps_blend: Vec<u8>,
+    pub ps_upscale: Vec<u8>,
     pub ps_rcas: Vec<u8>,
     pub ps_hud: Vec<u8>,
     pub cs_flow: Vec<u8>,
+    pub cs_flow_smooth: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -57,10 +61,12 @@ pub fn compile_all() -> Result<ShaderBinaries, GfxError> {
 fn compile_all_uncached() -> Result<ShaderBinaries, GfxError> {
     Ok(ShaderBinaries {
         vs: compile(VS_FULLSCREEN, "vs_fullscreen", "main", "vs_5_0")?,
-        ps_compose: compile(PS_COMPOSE, "ps_compose", "main", "ps_5_0")?,
+        ps_blend: compile(PS_BLEND, "ps_blend", "main", "ps_5_0")?,
+        ps_upscale: compile(PS_UPSCALE, "ps_upscale", "main", "ps_5_0")?,
         ps_rcas: compile(PS_RCAS, "ps_rcas", "main", "ps_5_0")?,
         ps_hud: compile(PS_HUD, "ps_hud", "main", "ps_5_0")?,
         cs_flow: compile(CS_FLOW, "cs_flow", "main", "cs_5_0")?,
+        cs_flow_smooth: compile(CS_FLOW_SMOOTH, "cs_flow_smooth", "main", "cs_5_0")?,
     })
 }
 

@@ -23,6 +23,16 @@ fn main() {
                 std::process::exit(1);
             }
             println!("render motion/upscale selftest: PASS");
+            if let Err(e) = fluid_gfx::selftest::render_scene_cut_fallback() {
+                eprintln!("render scene-cut fallback selftest: FAIL: {e}");
+                std::process::exit(1);
+            }
+            println!("render scene-cut fallback selftest: PASS");
+            if let Err(e) = fluid_gfx::selftest::render_adaptive_upscale() {
+                eprintln!("render adaptive upscale selftest: FAIL: {e}");
+                std::process::exit(1);
+            }
+            println!("render adaptive upscale selftest: PASS");
             if let Err(e) = fluid_gfx::selftest::render_hud_window() {
                 eprintln!("render independent HUD selftest: FAIL: {e}");
                 std::process::exit(1);
@@ -296,11 +306,26 @@ fn wgc_probe() -> Result<(), String> {
     let start = Instant::now();
     let mut frames = 0u32;
     let mut polls = 0u32;
+    let mut timestamp_samples = Vec::new();
     while start.elapsed() < Duration::from_secs(2) {
         polls += 1;
         match capture.acquire_latest() {
-            Ok(Some(_)) => {
+            Ok(Some(frame)) => {
                 frames += 1;
+                if timestamp_samples.len() < 8 {
+                    let now = qpc_now();
+                    let signed_age_us = if frame.qpc > now {
+                        -(qpc_diff_us(now, frame.qpc, qpc_freq()) as i64)
+                    } else {
+                        qpc_diff_us(frame.qpc, now, qpc_freq()) as i64
+                    };
+                    timestamp_samples.push((
+                        frame.system_relative_100ns,
+                        frame.qpc,
+                        now,
+                        signed_age_us as f64 / 1000.0,
+                    ));
+                }
                 capture.release_frame();
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(1)),
@@ -308,7 +333,7 @@ fn wgc_probe() -> Result<(), String> {
         }
     }
     println!(
-        "WGC probe: frames={frames}/2s polls={polls} size={}x{}",
+        "WGC probe: frames={frames}/2s polls={polls} size={}x{} timestamp ages={timestamp_samples:?} ms",
         capture.width(),
         capture.height()
     );

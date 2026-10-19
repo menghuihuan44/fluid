@@ -4,7 +4,7 @@
 //! fluid overlay is a separate top-level window, so presenting it does not
 //! generate new frames in the captured window. This keeps idle GPU load low.
 
-use crate::clock::qpc_now;
+use crate::clock::{qpc_now, system_relative_100ns_to_qpc};
 use crate::duplication::CaptureError;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
@@ -35,11 +35,56 @@ pub struct WgcCapture {
     direct3d_device: IDirect3DDevice,
     width: u32,
     height: u32,
+    timestamp_normalizer: TimestampNormalizer,
+    last_frame_qpc: i64,
 }
 
 pub struct WgcFrame<'a> {
     pub texture: &'a ID3D11Texture2D,
     pub qpc: i64,
+    /// Raw WinRT timestamp for diagnostics; zero when unavailable.
+    pub system_relative_100ns: i64,
+}
+
+const TIMESTAMP_WARMUP_SAMPLES: u32 = 16;
+
+/// Normalize the compositor timestamp to QPC without erasing its inter-frame
+/// intervals. During warmup the largest observed delivery lead is retained;
+/// afterwards the correction is frozen and only widened if a frame would
+/// otherwise be stamped in the future.
+#[derive(Default)]
+struct TimestampNormalizer {
+    bias: Option<i64>,
+    samples: u32,
+    last: i64,
+}
+
+impl TimestampNormalizer {
+    fn normalize(&mut self, raw_qpc: i64, received_qpc: i64) -> i64 {
+        let lead = (received_qpc as i128 - raw_qpc as i128)
+            .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        let mut bias = match self.bias {
+            None => lead,
+            Some(b) if self.samples < TIMESTAMP_WARMUP_SAMPLES => b.min(lead),
+            Some(b) => b,
+        };
+        self.samples = self.samples.saturating_add(1);
+        self.bias = Some(bias);
+        let mut corrected = raw_qpc.saturating_add(bias);
+        if corrected > received_qpc {
+            bias = bias.min(lead);
+            self.bias = Some(bias);
+            corrected = raw_qpc.saturating_add(bias).min(received_qpc);
+        }
+        // Timestamps must never move backwards when a bias refinement occurs.
+        let monotonic = if self.last > 0 {
+            corrected.max(self.last.saturating_add(1))
+        } else {
+            corrected
+        };
+        self.last = monotonic;
+        monotonic.max(1)
+    }
 }
 
 // WGC was created with Direct3D11CaptureFramePool::CreateFreeThreaded and the
@@ -148,6 +193,8 @@ impl WgcCapture {
             direct3d_device,
             width: size.Width as u32,
             height: size.Height as u32,
+            timestamp_normalizer: TimestampNormalizer::default(),
+            last_frame_qpc: 0,
         })
     }
 
@@ -217,11 +264,34 @@ impl WgcCapture {
         let surface: IDirect3DSurface = frame.Surface()?;
         let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
         let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
+        // WGC carries the compositor's frame timestamp. Using the polling
+        // instant here would quantize every source interval to our output
+        // cadence and make frame-generation phases jitter. Fall back to QPC
+        // only when the platform does not provide the timestamp.
+        let received_qpc = qpc_now();
+        let raw_timestamp = frame.SystemRelativeTime().ok().map(|t| t.Duration);
+        let raw_qpc = raw_timestamp
+            .map(system_relative_100ns_to_qpc)
+            .filter(|&v| v > 0);
+        let frame_qpc = if let Some(raw_qpc) = raw_qpc {
+            let normalized = self.timestamp_normalizer.normalize(raw_qpc, received_qpc);
+            let monotonic = if self.last_frame_qpc > 0 {
+                normalized.max(self.last_frame_qpc.saturating_add(1))
+            } else {
+                normalized
+            };
+            self.last_frame_qpc = monotonic;
+            (monotonic, raw_timestamp.unwrap_or(0))
+        } else {
+            self.last_frame_qpc = received_qpc.max(self.last_frame_qpc);
+            (self.last_frame_qpc, 0)
+        };
         self.texture = Some(texture);
         self.frame = Some(frame);
         Ok(Some(WgcFrame {
             texture: self.texture.as_ref().unwrap(),
-            qpc: qpc_now(),
+            qpc: frame_qpc.0,
+            system_relative_100ns: frame_qpc.1,
         }))
     }
 
@@ -245,5 +315,45 @@ impl Drop for WgcCapture {
         let _ = self._session.Close();
         let _ = self.frame_pool.Close();
         tracing::debug!("WGC cleanup: capture session closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TimestampNormalizer;
+
+    #[test]
+    fn warmup_then_frozen_bias_preserves_source_intervals() {
+        let mut n = TimestampNormalizer::default();
+        let raw_step = 5_000_000i64; // 500 ms at QPC/10 MHz scale
+        let mut raw = 100_000_000i64;
+        let mut received = raw - 35_000; // delivered 3.5 ms early
+        for _ in 0..20 {
+            let corrected = n.normalize(raw, received);
+            assert!(corrected <= received);
+            raw += raw_step;
+            received = raw - 35_000;
+        }
+
+        // After the correction is frozen, raw timestamp deltas must survive;
+        // they are what the interpolation phase depends on.
+        let a = n.normalize(raw, received);
+        raw += raw_step;
+        received = raw - 35_000;
+        let b = n.normalize(raw, received);
+        assert_eq!(b - a, raw_step);
+    }
+
+    #[test]
+    fn a_larger_lead_never_creates_a_future_timestamp() {
+        let mut n = TimestampNormalizer::default();
+        for i in 0..20 {
+            let raw = 1_000_000_000 + i * 5_000_000;
+            let received = raw - 2_000_000;
+            assert!(n.normalize(raw, received) <= received);
+        }
+        let raw = 1_000_000_000 + 21 * 5_000_000;
+        let received = raw - 8_000_000;
+        assert!(n.normalize(raw, received) <= received);
     }
 }

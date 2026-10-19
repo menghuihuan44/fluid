@@ -34,26 +34,47 @@ or video file itself.
   added directly without searching the list.
 - **Recursion-safe overlay**: DirectComposition, FLIP_DISCARD, a waitable
   swapchain with MaximumFrameLatency=1, and WDA_EXCLUDEFROMCAPTURE.
-- **GPU-only hot path**: captured textures flow through a 2-slot GPU ring. The CPU
-  only updates small constant buffers and statistics; no pixel readback.
+- **GPU-only hot path**: captured textures flow through a 3-slot GPU ring. The CPU
+  only updates small constant buffers and statistics; no pixel readback. WGC
+  frames carry their compositor timestamps, normalized to QPC so interpolation
+  phases do not inherit polling jitter.
 - **Motion-compensated interpolation**:
-  - A GPU compute pass performs coarse-to-fine block motion estimation at 1/8
-    source resolution.
-  - It emits motion vectors, residual, and confidence.
-  - A pixel shader warps both endpoint frames and blends them at the requested
-    display time.
-  - Scene cuts, occlusions, and low-confidence motion automatically fall back to
-    the real current frame to avoid large ghosting artifacts.
-- **Image-quality pass**:
-  - Adaptive 4x4 Catmull-Rom reconstruction.
-  - Local color-range clamping to suppress edge ringing.
+  - A hierarchical GPU compute estimator searches a mip pyramid at 1/8 source
+    resolution, then refines to sub-pixel precision. It re-baselines every
+    pyramid level and rejects an inherited coarse vector when it loses to the
+    static hypothesis, preventing sky/wall/UI regions from carrying garbage
+    motion into the blend.
+  - A confidence- and vector-aware bilateral pass removes block seams without
+    smoothing across object boundaries.
+  - A pixel shader warps both endpoint frames, checks endpoint agreement,
+    forward/backward flow consistency, estimator confidence, and a
+    motion-aware global scene-cut residual.
+  - The confidence gate is strict: high-confidence pixels use the pure
+    interpolated result (no permanent ghost of the current frame), while
+    occluded, low-confidence, and scene-cut pixels fall back to the real current
+    frame.
+- **Image-quality passes**:
+  - Adaptive Catmull-Rom reconstruction, run as two separable passes
+    (4 horizontal + 4 vertical taps) for magnification. This preserves the
+    cubic kernel while roughly halving texture-fetch cost versus a direct 4x4
+    kernel, and uses a compact temporary surface.
+  - Four-tap area reconstruction for minification, with local range clamping on
+    each axis to suppress ringing.
   - RCAS-style contrast-adaptive sharpening with anti-ringing clamping.
+  - Native-resolution fast paths: unsharpened 1:1 frames are copied directly,
+    sharpened 1:1 frames go through one RCAS pass, and native interpolated frames
+    bypass the spatial scaler entirely.
 - **Output modes**:
   - Match the target window size.
   - Fit the target window to its monitor, for low-resolution borderless windows
     used with external upscaling.
-- **Low-latency presentation**: accumulated-frame accounting, refresh pacing,
-  SyncInterval=0 mode, and an optional Vsync mode.
+- **Low-latency, deterministic presentation**: an absolute output cadence avoids
+  accumulated drift; the interpolation lookback is derived from the attainable
+  multiplier so exact 2x/3x/4x schedules use every interior phase; pacing happens
+  immediately before capture so the newest frame is used; a bounded
+  MaximumFrameLatency=1 wait prevents hidden render-ahead; SyncInterval=0 is the
+  default and Vsync remains optional. The requested multiplier is capped by the
+  display refresh, and target versus measured multiplier is shown in the HUD.
 - **Long-session stability**: the capture D3D11/DirectComposition session is
   reused across Start/Stop instead of creating a device per start. WGC teardown
   runs on one serialized cleanup worker with explicit `Close()`, preventing the
@@ -66,8 +87,8 @@ or video file itself.
   always-on-top small window with its own tiny DirectComposition swapchain and
   dedicated render thread. It shows source/backend, source and output resolution,
   refresh rate, capture/output FPS, GPU time, latency, drops, generated FPS,
-  interpolation phase, process CPU/RAM, active quality/output parameters, and
-  frame-generation parameters. It can be placed in any monitor corner or at a
+  target/effective multiplier, interpolation phase, process CPU/RAM, active
+  quality/output parameters, and frame-generation parameters. It can be placed in any monitor corner or at a
   custom normalized position, with selectable sections, font scale, margin,
   arbitrary background color, and whole-window opacity. Text is rasterized at
   ~4 Hz only when the HUD is visible;
@@ -89,21 +110,29 @@ or video file itself.
 target window / desktop
       |
       v
-DXGI Desktop Duplication (read-only)
+WGC window capture / DXGI Desktop Duplication (read-only)
       |  GPU CopyResource
       v
-3-slot GPU frame ring
+3-slot GPU frame ring with lazily generated mip pyramids
       |
-      +-- compute: coarse-to-fine motion estimation at 1/8 resolution
-      |
-      v
-ps_compose: temporal interpolation + bidirectional warp + scene/occlusion
-            fallback + adaptive spatial reconstruction
+      +-- cs_flow: hierarchical coarse-to-fine motion search
+      +-- cs_flow_smooth: confidence/vector-aware bilateral filter
       |
       v
-ps_rcas: contrast-adaptive sharpening
+ps_blend (source resolution): endpoint warp + occlusion/scene-cut gates
       |
-      v
+      +-- native 1:1 ------------------------------------------+
+      |                                                       |
+      v                                                       |
+ps_upscale (output resolution)                                |
+  adaptive: horizontal 4-tap -> vertical 4-tap                 |
+  bilinear/nearest/minification: single pass                   |
+      |                                                       |
+      +--------------------------+----------------------------+
+                                 v
+ps_rcas: contrast-adaptive sharpening (skipped when off)
+                                 |
+                                 v
 capture overlay -> DirectComposition overlay window
                    (click-through, excluded from capture)
 
@@ -145,9 +174,10 @@ cargo run -p fluid-testkit -- wgc-scan
 cargo run -p fluid-testkit -- capture 3
 ```
 
-- `render` runs three WARP GPU regression tests: identity composition/upscale,
-  two-frame motion estimation + interpolation + adaptive scaling + sharpening, and
-  the independent multi-line HUD renderer.
+- `render` runs WARP GPU regression tests for identity rendering and HUD
+  compositing, two-frame motion-compensated interpolation, hard-scene-cut
+  fallback, the two-pass separable adaptive upscaler with aspect-preserving
+  letterboxing, and the independent multi-line HUD renderer.
 - `hud` runs only the independent HUD rasterization/upload/draw test.
 - `overlay` smoke-tests DirectComposition and the waitable swapchain.
 - `wgc` probes Windows Graphics Capture against a visible target window.
@@ -175,13 +205,14 @@ cargo run -p fluid-testkit -- capture 3
 5. Enable motion-compensated interpolation if desired.
    - It only activates when the captured frame rate is meaningfully lower than the
      display refresh rate (for example 60 FPS source on a 120 Hz display).
-   - Interpolation needs two endpoint frames, so it adds roughly half a capture
-     interval of latency. That physical cost cannot be fully removed by an external
-     interpolator.
+   - Interpolation needs two endpoint frames. For an attainable N-times schedule
+     the phase clock looks back by (N-1)/N of a source interval; that physical
+     cost cannot be fully removed by an external interpolator.
 6. Click Start or press Ctrl+Alt+Shift+F9. The overlay is click-through, so mouse
    input reaches the game. The settings window minimizes by default to leave the
-   foreground CPU/GPU budget to the game. The interpolation multiplier caps GPU
-   spending: 2x is conservative, 3-4x favors smoothness.
+   foreground CPU/GPU budget to the game. The requested multiplier caps GPU
+   spending and is automatically capped again by the display refresh rate.
+   2x is conservative; 3-8x can request smoother motion when the display allows.
 7. Ctrl+Alt+Shift+F8 stops capture and restores the settings window even if the
    tray icon or taskbar button is not reachable. Ctrl+Alt+Shift+F9 stops/starts
    capture even while the UI is minimized. Ctrl+Alt+Shift+F10 toggles the HUD.
@@ -235,7 +266,10 @@ particular process combinations. Follow the specific game's rules and terms.
   for the most predictable colors. Exact HDR metadata and wide-gamut management are
   future work.
 - Fast rotation, particles, camera cuts, and flickering UI may trigger fallback or
-  minor artifacts.
+  minor artifacts. External frame generation cannot invent a new source frame:
+  when capture stalls or the target frame rate exceeds the display refresh, the
+  scheduler caps the target multiplier rather than duplicating frames and
+  pretending they were generated.
 - WGC may show the Windows capture border on older Windows builds where
   `SetIsBorderRequired(false)` is unavailable.
 - Foreground mode follows the active non-fluid window. Switching to a tiny
@@ -306,8 +340,8 @@ Old configuration files are migrated automatically with defaults.
 
 - Configurable hotkeys, per-game profiles, and an option to tune settings while
   capture is running without stopping.
-- Temporal motion-field smoothing, better occlusion detection, UI protection, and
-  further interpolation quality tuning.
+- Further motion-estimator tuning for very large/rotational motion, stronger UI
+  protection, and a per-scene quality benchmark corpus.
 - Explicit HDR metadata/color management, FSR1/neural upscaler integration, and an
   offline video interpolation CLI.
 - Objective multi-GPU latency/quality benchmarks and a release packaging pipeline.

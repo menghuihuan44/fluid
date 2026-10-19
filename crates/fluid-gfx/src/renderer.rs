@@ -1,9 +1,21 @@
 //! GPU render pipeline:
-//! captured frame ring -> optional motion field -> frame composition/upscale
-//! -> contrast-adaptive sharpening -> HUD overlay -> waitable swapchain.
+//! captured frame ring (with lazy mip pyramid) -> optional hierarchical motion
+//! field + bilateral smoothing -> source-resolution temporal blend -> optional
+//! separable output-resolution reconstruction -> optional contrast-adaptive
+//! sharpening -> HUD -> waitable swapchain.
 //!
 //! Everything stays on the GPU. The CPU never copies pixels and only writes a
 //! few constant-buffer values per presented frame.
+//!
+//! The pipeline is split so each pass does one job:
+//!   ps_blend    (source res)   motion-compensated temporal blend + occlusion,
+//!                              confidence and scene-cut gating;
+//!   ps_upscale  (output res)   two-pass separable Catmull-Rom for magnification,
+//!                              single-pass area filter for minification,
+//!                              letterboxing, HDR conversion;
+//!   ps_rcas     (output res)   FSR1-style robust contrast-adaptive sharpening.
+//! Native 1:1 output bypasses the blend/scale intermediates, and a direct RCAS
+//! path avoids two full-frame passes when only sharpening is requested.
 
 use crate::error::GfxError;
 use crate::hud::HudTexture;
@@ -22,8 +34,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_FILL_SOLID, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_QUERY,
     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC, D3D11_QUERY_TIMESTAMP,
     D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_BLEND_DESC,
-    D3D11_SAMPLER_DESC, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT,
-    D3D11_VIEWPORT,
+    D3D11_RESOURCE_MISC_GENERATE_MIPS, D3D11_SAMPLER_DESC, D3D11_TEXTURE2D_DESC,
+    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
@@ -133,6 +145,8 @@ pub struct RenderRequest<'a> {
 #[derive(Clone)]
 pub struct FrameSnapshot {
     srv: ID3D11ShaderResourceView,
+    tex: ID3D11Texture2D,
+    slot: usize,
     pub qpc: i64,
     pub seq: u64,
 }
@@ -142,6 +156,10 @@ pub struct FrameSlot {
     srv: ID3D11ShaderResourceView,
     pub qpc: i64,
     pub seq: u64,
+    /// True once the mip pyramid of this slot has been generated for the
+    /// hierarchical motion estimator. Mips are built lazily so a session with
+    /// frame generation disabled never pays for them.
+    mips_valid: bool,
 }
 
 struct QueryPair {
@@ -167,14 +185,25 @@ struct FlowTarget {
     h: u32,
 }
 
+struct BlendTarget {
+    _tex: ID3D11Texture2D,
+    srv: ID3D11ShaderResourceView,
+    rtv: ID3D11RenderTargetView,
+    w: u32,
+    h: u32,
+    format: DXGI_FORMAT,
+}
+
 pub struct Renderer {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     vs: ID3D11VertexShader,
-    ps_compose: ID3D11PixelShader,
+    ps_blend: ID3D11PixelShader,
+    ps_upscale: ID3D11PixelShader,
     ps_rcas: ID3D11PixelShader,
     ps_hud: ID3D11PixelShader,
     cs_flow: ID3D11ComputeShader,
+    cs_flow_smooth: ID3D11ComputeShader,
     sampler: ID3D11SamplerState,
     cbuf: ID3D11Buffer,
     flow_cbuf: ID3D11Buffer,
@@ -194,8 +223,16 @@ pub struct Renderer {
     head: usize,
     seq: u64,
     output: Option<OutputTarget>,
+    blend: Option<BlendTarget>,
+    /// Intermediate for the two-pass separable reconstruction. It stores the
+    /// horizontally scaled image at source height and never leaves the GPU.
+    scale: Option<BlendTarget>,
     flow: Option<FlowTarget>,
+    flow_smooth: Option<FlowTarget>,
     flow_key: Option<(u64, u64)>,
+    /// Mip level of the raw flow texture whose ~2x2 average approximates a
+    /// whole-frame statistic for the scene-cut gate.
+    flow_lod: f32,
     queries: [QueryPair; 2],
     q_slot: usize,
     gpu_us: f32,
@@ -214,18 +251,20 @@ fn create_2d(
     h: u32,
     format: DXGI_FORMAT,
     bind_flags: u32,
+    mips: u32,
+    misc: u32,
 ) -> Result<ID3D11Texture2D, GfxError> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: w.max(1),
         Height: h.max(1),
-        MipLevels: 1,
+        MipLevels: mips,
         ArraySize: 1,
         Format: format,
         SampleDesc: sample_desc(),
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: bind_flags,
         CPUAccessFlags: 0,
-        MiscFlags: 0,
+        MiscFlags: misc,
     };
     let mut tex = None;
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }.map_err(|e| {
@@ -236,13 +275,66 @@ fn create_2d(
     Ok(tex.unwrap())
 }
 
+fn rt_srv(
+    device: &ID3D11Device,
+    tex: &ID3D11Texture2D,
+) -> Result<(ID3D11ShaderResourceView, ID3D11RenderTargetView), GfxError> {
+    let mut srv = None;
+    let mut rtv = None;
+    unsafe {
+        device
+            .CreateShaderResourceView(tex, None, Some(&mut srv))
+            .map_err(|e| GfxError::Other(format!("CreateShaderResourceView: {e}")))?;
+        device
+            .CreateRenderTargetView(tex, None, Some(&mut rtv))
+            .map_err(|e| GfxError::Other(format!("CreateRenderTargetView: {e}")))?;
+    }
+    Ok((srv.unwrap(), rtv.unwrap()))
+}
+
+/// Output content rectangle after optional aspect preservation. Returning
+/// integers here keeps every render target allocation exact and lets the
+/// renderer decide whether a two-pass separable scaler is worthwhile.
+fn content_dimensions(
+    source_w: u32,
+    source_h: u32,
+    out_w: u32,
+    out_h: u32,
+    preserve_aspect: bool,
+) -> (u32, u32) {
+    if !preserve_aspect {
+        return (out_w.max(1), out_h.max(1));
+    }
+    let src_aspect = source_w.max(1) as f32 / source_h.max(1) as f32;
+    let out_aspect = out_w.max(1) as f32 / out_h.max(1) as f32;
+    let (w, h) = if out_aspect > src_aspect {
+        (out_h as f32 * src_aspect, out_h as f32)
+    } else {
+        (out_w as f32, out_w as f32 / src_aspect)
+    };
+    (
+        (w.round() as u32).clamp(1, out_w.max(1)),
+        (h.round() as u32).clamp(1, out_h.max(1)),
+    )
+}
+
+/// Ring slots carry a full mip pyramid so the hierarchical motion estimator
+/// can search coarse levels cheaply. Mips are generated lazily per slot.
 fn ring_texture(
     device: &ID3D11Device,
     w: u32,
     h: u32,
     format: DXGI_FORMAT,
 ) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView), GfxError> {
-    let tex = create_2d(device, w, h, format, D3D11_BIND_SHADER_RESOURCE.0 as u32)?;
+    let tex = create_2d(
+        device,
+        w,
+        h,
+        format,
+        (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+        0,
+        D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+    )?;
     let mut srv = None;
     unsafe { device.CreateShaderResourceView(&tex, None, Some(&mut srv)) }
         .map_err(|e| GfxError::Other(format!("CreateShaderResourceView for ring: {e}")))?;
@@ -255,19 +347,23 @@ impl Renderer {
         ctx: &ID3D11DeviceContext,
         ring_len: usize,
     ) -> Result<Self, GfxError> {
-        let ring_len = ring_len.max(2);
+        let ring_len = ring_len.clamp(2, 8);
         let bins = shaders::compile_all()?;
         unsafe {
             let mut vs = None;
-            let mut ps_compose = None;
+            let mut ps_blend = None;
+            let mut ps_upscale = None;
             let mut ps_rcas = None;
             let mut ps_hud = None;
             let mut cs_flow = None;
+            let mut cs_flow_smooth = None;
             device.CreateVertexShader(&bins.vs, None, Some(&mut vs))?;
-            device.CreatePixelShader(&bins.ps_compose, None, Some(&mut ps_compose))?;
+            device.CreatePixelShader(&bins.ps_blend, None, Some(&mut ps_blend))?;
+            device.CreatePixelShader(&bins.ps_upscale, None, Some(&mut ps_upscale))?;
             device.CreatePixelShader(&bins.ps_rcas, None, Some(&mut ps_rcas))?;
             device.CreatePixelShader(&bins.ps_hud, None, Some(&mut ps_hud))?;
             device.CreateComputeShader(&bins.cs_flow, None, Some(&mut cs_flow))?;
+            device.CreateComputeShader(&bins.cs_flow_smooth, None, Some(&mut cs_flow_smooth))?;
 
             let sdesc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -393,10 +489,12 @@ impl Renderer {
                 device: device.clone(),
                 ctx: ctx.clone(),
                 vs: vs.unwrap(),
-                ps_compose: ps_compose.unwrap(),
+                ps_blend: ps_blend.unwrap(),
+                ps_upscale: ps_upscale.unwrap(),
                 ps_rcas: ps_rcas.unwrap(),
                 ps_hud: ps_hud.unwrap(),
                 cs_flow: cs_flow.unwrap(),
+                cs_flow_smooth: cs_flow_smooth.unwrap(),
                 sampler: sampler.unwrap(),
                 cbuf,
                 flow_cbuf,
@@ -416,8 +514,12 @@ impl Renderer {
                 head: 0,
                 seq: 0,
                 output: None,
+                blend: None,
+                scale: None,
                 flow: None,
+                flow_smooth: None,
                 flow_key: None,
+                flow_lod: 0.0,
                 queries,
                 q_slot: 0,
                 gpu_us: 0.0,
@@ -443,6 +545,7 @@ impl Renderer {
                 srv,
                 qpc: 0,
                 seq: 0,
+                mips_valid: false,
             });
         }
         self.ring = ring;
@@ -452,7 +555,7 @@ impl Renderer {
         self.head = 0;
         self.seq = 0;
         self.flow_key = None;
-        tracing::info!("frame ring allocated: {len} x {w}x{h}, format={format:?}");
+        tracing::info!("frame ring allocated: {len} x {w}x{h}, format={format:?} (mip chain)");
         Ok(())
     }
 
@@ -460,6 +563,7 @@ impl Renderer {
         for slot in &mut self.ring {
             slot.qpc = 0;
             slot.seq = 0;
+            slot.mips_valid = false;
         }
         self.head = 0;
         self.seq = 0;
@@ -475,7 +579,9 @@ impl Renderer {
         self.ensure_ring(w, h, DXGI_FORMAT_B8G8R8A8_UNORM)
     }
 
-    /// Copy a newly acquired DDA texture into the ring (GPU-side only).
+    /// Copy a newly acquired DDA/WGC texture into the ring (GPU-side only).
+    /// Only mip 0 is copied; the rest of the pyramid is generated lazily when
+    /// the motion estimator first needs this slot.
     pub fn push_frame(&mut self, src: &ID3D11Texture2D, qpc: i64) {
         if self.ring.is_empty() {
             return;
@@ -483,8 +589,12 @@ impl Renderer {
         let head = self.head;
         {
             let slot = &mut self.ring[head];
-            unsafe { self.ctx.CopyResource(&slot.tex, src) };
+            unsafe {
+                self.ctx
+                    .CopySubresourceRegion(&slot.tex, 0, 0, 0, 0, src, 0, None);
+            }
             slot.qpc = qpc;
+            slot.mips_valid = false;
         }
         self.seq += 1;
         self.ring[head].seq = self.seq;
@@ -495,6 +605,8 @@ impl Renderer {
         let slot = &self.ring[idx];
         FrameSnapshot {
             srv: slot.srv.clone(),
+            tex: slot.tex.clone(),
+            slot: idx,
             qpc: slot.qpc,
             seq: slot.seq,
         }
@@ -509,29 +621,45 @@ impl Renderer {
     }
 
     /// Select the captured pair that brackets `target_qpc` and return the
-    /// interpolation phase. The render loop targets `now - half_capture_interval`
-    /// so two endpoint frames are always available before we display the blend.
+    /// interpolation phase. The pipeline targets a scheduled presentation
+    /// instant minus an attainable-multiplier lookback, so two endpoint frames
+    /// are available for every interior phase and the N-1 generated slots of an
+    /// exact N-times schedule are not skipped.
     pub fn pair_at_time(&self, target_qpc: i64) -> Option<(FrameSnapshot, FrameSnapshot, f32)> {
         if self.ring.is_empty() {
             return None;
         }
-        let mut entries: Vec<(u64, i64, usize)> = self
-            .ring
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.seq > 0)
-            .map(|(i, f)| (f.seq, f.qpc, i))
-            .collect();
-        if entries.is_empty() {
+        // Stack buffer instead of a heap Vec: this runs once per presented
+        // frame and the ring is at most 8 slots.
+        let mut entries: [(u64, i64, usize); 8] = [(0, 0, 0); 8];
+        let mut n = 0usize;
+        for (i, f) in self.ring.iter().enumerate() {
+            if f.seq > 0 {
+                entries[n] = (f.seq, f.qpc, i);
+                n += 1;
+                if n == 8 {
+                    break;
+                }
+            }
+        }
+        if n == 0 {
             return None;
         }
-        entries.sort_by_key(|(seq, _, _)| *seq);
-        if entries.len() == 1 {
+        for i in 1..n {
+            let key = entries[i];
+            let mut j = i;
+            while j > 0 && entries[j - 1].0 > key.0 {
+                entries[j] = entries[j - 1];
+                j -= 1;
+            }
+            entries[j] = key;
+        }
+        if n == 1 {
             let s = self.snapshot(entries[0].2);
             return Some((s.clone(), s, 1.0));
         }
 
-        for pair in entries.windows(2) {
+        for pair in entries[..n].windows(2) {
             let (_, a_qpc, a_idx) = pair[0];
             let (_, b_qpc, b_idx) = pair[1];
             if b_qpc > a_qpc {
@@ -549,8 +677,8 @@ impl Renderer {
             }
         }
 
-        let a_idx = entries[entries.len() - 2].2;
-        let b_idx = entries[entries.len() - 1].2;
+        let a_idx = entries[n - 2].2;
+        let b_idx = entries[n - 1].2;
         Some((self.snapshot(a_idx), self.snapshot(b_idx), 1.0))
     }
 
@@ -634,26 +762,75 @@ impl Renderer {
             h,
             DXGI_FORMAT_B8G8R8A8_UNORM,
             (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            1,
+            0,
         )?;
-        let mut srv = None;
-        let mut rtv = None;
-        unsafe {
-            self.device
-                .CreateShaderResourceView(&tex, None, Some(&mut srv))
-                .map_err(|e| {
-                    GfxError::Other(format!("CreateShaderResourceView for output: {e}"))
-                })?;
-            self.device
-                .CreateRenderTargetView(&tex, None, Some(&mut rtv))
-                .map_err(|e| GfxError::Other(format!("CreateRenderTargetView for output: {e}")))?;
-        }
+        let (srv, rtv) = rt_srv(&self.device, &tex)?;
         self.output = Some(OutputTarget {
             _tex: tex,
-            srv: srv.unwrap(),
-            rtv: rtv.unwrap(),
+            srv,
+            rtv,
             w,
             h,
         });
+        Ok(())
+    }
+
+    /// Source-resolution intermediate that receives the temporal blend.
+    fn ensure_blend(&mut self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<(), GfxError> {
+        if let Some(blend) = &self.blend {
+            if blend.w == w && blend.h == h && blend.format == format {
+                return Ok(());
+            }
+        }
+        let tex = create_2d(
+            &self.device,
+            w,
+            h,
+            format,
+            (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            1,
+            0,
+        )?;
+        let (srv, rtv) = rt_srv(&self.device, &tex)?;
+        self.blend = Some(BlendTarget {
+            _tex: tex,
+            srv,
+            rtv,
+            w,
+            h,
+            format,
+        });
+        tracing::debug!("blend target allocated: {w}x{h} format={format:?}");
+        Ok(())
+    }
+
+    /// Allocate the horizontal half of the separable adaptive upscaler.
+    fn ensure_scale(&mut self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<(), GfxError> {
+        if let Some(scale) = &self.scale {
+            if scale.w == w && scale.h == h && scale.format == format {
+                return Ok(());
+            }
+        }
+        let tex = create_2d(
+            &self.device,
+            w,
+            h,
+            format,
+            (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            1,
+            0,
+        )?;
+        let (srv, rtv) = rt_srv(&self.device, &tex)?;
+        self.scale = Some(BlendTarget {
+            _tex: tex,
+            srv,
+            rtv,
+            w,
+            h,
+            format,
+        });
+        tracing::debug!("separable scale target allocated: {w}x{h} format={format:?}");
         Ok(())
     }
 
@@ -663,47 +840,110 @@ impl Renderer {
                 return Ok(());
             }
         }
-        let tex = create_2d(
+        // Raw field: full mip pyramid so the blend pass can read a whole-frame
+        // statistic for the scene-cut gate.
+        let raw = create_2d(
+            &self.device,
+            w,
+            h,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            (D3D11_BIND_UNORDERED_ACCESS.0
+                | D3D11_BIND_SHADER_RESOURCE.0
+                | D3D11_BIND_RENDER_TARGET.0) as u32,
+            0,
+            D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+        )?;
+        let mut raw_srv = None;
+        let mut raw_uav = None;
+        unsafe {
+            self.device
+                .CreateShaderResourceView(&raw, None, Some(&mut raw_srv))
+                .map_err(|e| GfxError::Other(format!("CreateShaderResourceView for flow: {e}")))?;
+            self.device
+                .CreateUnorderedAccessView(&raw, None, Some(&mut raw_uav))
+                .map_err(|e| GfxError::Other(format!("CreateUnorderedAccessView for flow: {e}")))?;
+        }
+        self.flow = Some(FlowTarget {
+            _tex: raw,
+            srv: raw_srv.unwrap(),
+            uav: raw_uav.unwrap(),
+            w,
+            h,
+        });
+
+        let smooth = create_2d(
             &self.device,
             w,
             h,
             DXGI_FORMAT_R16G16B16A16_FLOAT,
             (D3D11_BIND_UNORDERED_ACCESS.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            1,
+            0,
         )?;
-        let mut srv = None;
-        let mut uav = None;
+        let mut sm_srv = None;
+        let mut sm_uav = None;
         unsafe {
             self.device
-                .CreateShaderResourceView(&tex, None, Some(&mut srv))
-                .map_err(|e| GfxError::Other(format!("CreateShaderResourceView for flow: {e}")))?;
+                .CreateShaderResourceView(&smooth, None, Some(&mut sm_srv))
+                .map_err(|e| {
+                    GfxError::Other(format!("CreateShaderResourceView for flow smooth: {e}"))
+                })?;
             self.device
-                .CreateUnorderedAccessView(&tex, None, Some(&mut uav))
-                .map_err(|e| GfxError::Other(format!("CreateUnorderedAccessView for flow: {e}")))?;
+                .CreateUnorderedAccessView(&smooth, None, Some(&mut sm_uav))
+                .map_err(|e| {
+                    GfxError::Other(format!("CreateUnorderedAccessView for flow smooth: {e}"))
+                })?;
         }
-        self.flow = Some(FlowTarget {
-            _tex: tex,
-            srv: srv.unwrap(),
-            uav: uav.unwrap(),
+        self.flow_smooth = Some(FlowTarget {
+            _tex: smooth,
+            srv: sm_srv.unwrap(),
+            uav: sm_uav.unwrap(),
             w,
             h,
         });
+        self.flow_lod = ((w.max(h) as f32).log2() - 1.0).max(0.0);
         Ok(())
     }
 
+    fn ensure_mips(&mut self, slot: usize) {
+        let make_mips = {
+            let s = &self.ring[slot];
+            s.seq > 0 && !s.mips_valid
+        };
+        if make_mips {
+            let srv = self.ring[slot].srv.clone();
+            unsafe { self.ctx.GenerateMips(&srv) };
+            self.ring[slot].mips_valid = true;
+        }
+    }
+
     fn compute_flow(
-        &self,
+        &mut self,
         prev: &FrameSnapshot,
         curr: &FrameSnapshot,
         src_rect: [f32; 4],
         source_w: u32,
         source_h: u32,
     ) -> Result<(), GfxError> {
-        let Some(flow) = &self.flow else {
+        let Some(flow) = self.flow.as_ref() else {
             return Ok(());
         };
-        let radius = (source_w.min(source_h) as f32 * 0.018).clamp(4.0, 24.0);
-        let coarse_step = (radius * 0.5).max(1.0);
-        let refine_step = (coarse_step * 0.25).clamp(1.0, 4.0);
+        let (flow_w, flow_h) = (flow.w, flow.h);
+        let raw_srv = flow.srv.clone();
+        let raw_uav = flow.uav.clone();
+        let Some(smooth) = self.flow_smooth.as_ref() else {
+            return Ok(());
+        };
+        let (smooth_w, smooth_h) = (smooth.w, smooth.h);
+        let smooth_uav = smooth.uav.clone();
+        self.ensure_mips(prev.slot);
+        self.ensure_mips(curr.slot);
+
+        // Coarse step covers +/-2*step source pixels at LOD 3; one LOD-3 texel
+        // spans 8 source pixels, so 40 px step ~= 160 px/frame coverage range
+        // before the refinement ladder narrows it back to sub-pixel accuracy.
+        let max_dim = source_w.max(source_h) as f32;
+        let coarse_step = (max_dim / 48.0).clamp(8.0, 40.0);
         let params = FlowParams {
             src_rect,
             source_size: [
@@ -712,8 +952,8 @@ impl Renderer {
                 1.0 / source_w.max(1) as f32,
                 1.0 / source_h.max(1) as f32,
             ],
-            flow_size: [flow.w as f32, flow.h as f32, 0.0, 0.0],
-            search_cfg: [coarse_step, refine_step, 0.0008, 0.0],
+            flow_size: [flow_w as f32, flow_h as f32, 0.0, 0.0],
+            search_cfg: [coarse_step, 0.0008, 0.0, 0.0],
         };
         unsafe {
             self.ctx.UpdateSubresource(
@@ -724,23 +964,40 @@ impl Renderer {
                 0,
                 0,
             );
-            self.ctx.CSSetShader(&self.cs_flow, None);
             self.ctx
                 .CSSetConstantBuffers(0, Some(&[Some(self.flow_cbuf.clone())]));
             self.ctx
-                .CSSetShaderResources(0, Some(&[Some(prev.srv.clone()), Some(curr.srv.clone())]));
-            self.ctx
                 .CSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-            let uavs = [Some(flow.uav.clone())];
-            self.ctx
-                .CSSetUnorderedAccessViews(0, 1, Some(uavs.as_ptr()), None);
-            self.ctx.Dispatch(flow.w.div_ceil(8), flow.h.div_ceil(8), 1);
 
-            // Unbind compute resources before the pixel pass uses the flow SRV.
+            // Pass 1: hierarchical block matching into the raw field.
+            self.ctx.CSSetShader(&self.cs_flow, None);
+            self.ctx
+                .CSSetShaderResources(0, Some(&[Some(prev.srv.clone()), Some(curr.srv.clone())]));
+            let raw_uav = [Some(raw_uav)];
+            self.ctx
+                .CSSetUnorderedAccessViews(0, 1, Some(raw_uav.as_ptr()), None);
+            self.ctx.Dispatch(flow_w.div_ceil(8), flow_h.div_ceil(8), 1);
             let null_uav: Option<ID3D11UnorderedAccessView> = None;
             self.ctx
                 .CSSetUnorderedAccessViews(0, 1, Some(&null_uav), None);
+
+            // Build the raw-field pyramid for the scene-cut gate in ps_blend.
+            self.ctx.GenerateMips(&raw_srv);
+
+            // Pass 2: bilateral smoothing into the field the blend pass reads.
+            self.ctx.CSSetShader(&self.cs_flow_smooth, None);
             let null_srvs: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
+            self.ctx.CSSetShaderResources(0, Some(&null_srvs));
+            self.ctx.CSSetShaderResources(0, Some(&[Some(raw_srv)]));
+            let sm_uav = [Some(smooth_uav)];
+            self.ctx
+                .CSSetUnorderedAccessViews(0, 1, Some(sm_uav.as_ptr()), None);
+            self.ctx
+                .Dispatch(smooth_w.div_ceil(8), smooth_h.div_ceil(8), 1);
+
+            // Unbind compute resources before the pixel passes use the fields.
+            self.ctx
+                .CSSetUnorderedAccessViews(0, 1, Some(&null_uav), None);
             self.ctx.CSSetShaderResources(0, Some(&null_srvs));
             self.ctx.CSSetShader(None, None);
         }
@@ -766,15 +1023,13 @@ impl Renderer {
         // Release SRVs from the previous pass before a render target may be
         // reallocated. D3D11 requires a resource not to be bound as RTV and SRV
         // at the same time.
-        let null_srvs: [Option<ID3D11ShaderResourceView>; 3] = [None, None, None];
+        let null_srvs: [Option<ID3D11ShaderResourceView>; 4] = [None, None, None, None];
         unsafe {
             self.ctx.PSSetShaderResources(0, Some(&null_srvs));
         }
 
         let out_w = bb_w.max(1.0).round() as u32;
         let out_h = bb_h.max(1.0).round() as u32;
-        self.ensure_output(out_w, out_h)?;
-
         let uv_w = (uv_rect[2] - uv_rect[0]).max(1.0e-6);
         let uv_h = (uv_rect[3] - uv_rect[1]).max(1.0e-6);
         let source_w = (uv_w * self.ring_w.max(1) as f32).max(1.0).round() as u32;
@@ -784,22 +1039,11 @@ impl Renderer {
             && options.fg_phase < 0.999
             && previous.seq != current.seq;
         let use_motion = fg_active && options.motion_compensation;
-        if use_motion {
-            let flow_w = source_w.div_ceil(8).max(1);
-            let flow_h = source_h.div_ceil(8).max(1);
-            let flow_key = (previous.seq, current.seq);
-            let needs_flow = self.flow_key != Some(flow_key)
-                || self
-                    .flow
-                    .as_ref()
-                    .is_none_or(|flow| flow.w != flow_w || flow.h != flow_h);
-            if needs_flow {
-                self.ensure_flow(flow_w, flow_h)?;
-                self.compute_flow(previous, current, uv_rect, source_w, source_h)?;
-                self.flow_key = Some(flow_key);
-            }
-        }
+        let sharpen = options.sharpness.clamp(0.0, 1.0) > 0.0001;
 
+        let uv_full =
+            uv_rect[0] == 0.0 && uv_rect[1] == 0.0 && uv_rect[2] == 1.0 && uv_rect[3] == 1.0;
+        let ring_format = self.ring_format.unwrap_or(DXGI_FORMAT_B8G8R8A8_UNORM);
         let hud_rect = [0.0, 0.0, 1.0, 1.0];
         let cb = PerFrame {
             uv_rect,
@@ -824,7 +1068,7 @@ impl Renderer {
             ],
             params1: [
                 if use_motion { 1.0 } else { 0.0 },
-                if self.ring_format == Some(DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                if ring_format == DXGI_FORMAT_R16G16B16A16_FLOAT {
                     1.0
                 } else {
                     0.0
@@ -834,30 +1078,211 @@ impl Renderer {
             ],
             params2: [
                 0.45 - options.scene_protection.clamp(0.0, 1.0) * 0.35,
-                0.0,
+                self.flow_lod,
                 0.0,
                 0.0,
             ],
         };
 
-        let output_srv = self
-            .output
-            .as_ref()
-            .map(|o| o.srv.clone())
-            .ok_or_else(|| GfxError::Other("output target missing".into()))?;
-        let output_rtv = self
-            .output
-            .as_ref()
-            .map(|o| o.rtv.clone())
-            .ok_or_else(|| GfxError::Other("output target missing".into()))?;
-        let flow_srv = if use_motion {
-            self.flow
-                .as_ref()
-                .map(|f| f.srv.clone())
-                .unwrap_or_else(|| current.srv.clone())
+        // Native-resolution fast paths. They are by far the most common case
+        // with MatchWindow output: no temporal blend, no intermediate render
+        // target and no spatial reconstruction. Without frame generation the
+        // capture already has exactly the pixels the swapchain needs.
+        let native_direct = !fg_active
+            && hud_text.is_none()
+            && uv_full
+            && out_w == source_w
+            && out_h == source_h
+            && ring_format == DXGI_FORMAT_B8G8R8A8_UNORM;
+        if native_direct {
+            if !sharpen {
+                let resource = unsafe { rtv.GetResource() }.ok();
+                if let Some(dst) = resource {
+                    unsafe {
+                        self.ctx
+                            .CopySubresourceRegion(&dst, 0, 0, 0, 0, &current.tex, 0, None);
+                    }
+                    return Ok(());
+                }
+            } else {
+                // Sharpening does not need a full-resolution copy through the
+                // adaptive scaler. RCAS can read the captured texture directly,
+                // removing two full-frame passes from the native path.
+                let qp_slot = self.q_slot;
+                unsafe {
+                    self.ctx.Begin(&self.queries[qp_slot].disjoint);
+                    self.ctx.End(&self.queries[qp_slot].start);
+                    self.ctx.UpdateSubresource(
+                        &self.cbuf,
+                        0,
+                        None,
+                        &cb as *const PerFrame as *const core::ffi::c_void,
+                        0,
+                        0,
+                    );
+                    self.ctx
+                        .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    self.ctx.VSSetShader(&self.vs, None);
+                    self.ctx.RSSetState(Some(&self.rasterizer));
+                    self.ctx
+                        .OMSetBlendState(Some(&self.blend_opaque), None, 0xffff_ffff);
+                    self.ctx
+                        .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+                    self.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                        TopLeftX: 0.0,
+                        TopLeftY: 0.0,
+                        Width: bb_w,
+                        Height: bb_h,
+                        MinDepth: 0.0,
+                        MaxDepth: 1.0,
+                    }]));
+                    self.ctx
+                        .PSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
+                    self.ctx
+                        .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+                    self.ctx.PSSetShader(&self.ps_rcas, None);
+                    self.ctx
+                        .PSSetShaderResources(0, Some(&[Some(current.srv.clone())]));
+                    self.ctx.Draw(3, 0);
+                    self.ctx.End(&self.queries[qp_slot].end);
+                    let null_srvs: [Option<ID3D11ShaderResourceView>; 1] = [None];
+                    self.ctx.PSSetShaderResources(0, Some(&null_srvs));
+                }
+                self.queries[qp_slot].valid = true;
+                self.resolve((qp_slot + 1) % 2);
+                self.q_slot = (qp_slot + 1) % 2;
+                return Ok(());
+            }
+        }
+
+        let (content_w, content_h) =
+            content_dimensions(source_w, source_h, out_w, out_h, options.preserve_aspect);
+        // The separable kernel is only a win for true magnification. Mixed
+        // scale directions and minification stay on the single-pass area path.
+        let use_separable = options.scale_mode == 2 && content_w > source_w && content_h > source_h;
+        // Frame generation at native output resolution does not need any
+        // spatial reconstruction. The blend result can go straight to the
+        // swapchain (or to the RCAS intermediate when sharpening), saving a
+        // full-resolution blend target and the upscale draw every frame.
+        let direct_blend_native = fg_active
+            && uv_full
+            && out_w == source_w
+            && out_h == source_h
+            && ring_format == DXGI_FORMAT_B8G8R8A8_UNORM;
+        if sharpen {
+            self.ensure_output(out_w, out_h)?;
+        }
+        if use_separable {
+            self.ensure_scale(content_w, source_h, ring_format)?;
+        }
+        if use_motion {
+            let flow_w = source_w.div_ceil(8).max(1);
+            let flow_h = source_h.div_ceil(8).max(1);
+            let flow_key = (previous.seq, current.seq);
+            let needs_flow = self.flow_key != Some(flow_key)
+                || self
+                    .flow
+                    .as_ref()
+                    .is_none_or(|flow| flow.w != flow_w || flow.h != flow_h);
+            if needs_flow {
+                self.ensure_flow(flow_w, flow_h)?;
+                self.compute_flow(previous, current, uv_rect, source_w, source_h)?;
+                self.flow_key = Some(flow_key);
+            }
+        }
+        if !direct_blend_native {
+            self.ensure_blend(source_w, source_h, ring_format)?;
+        }
+
+        let output_rtv = if sharpen {
+            Some(
+                self.output
+                    .as_ref()
+                    .ok_or_else(|| GfxError::Other("output target missing".into()))?
+                    .rtv
+                    .clone(),
+            )
         } else {
-            current.srv.clone()
+            None
         };
+        let output_srv = if sharpen {
+            Some(
+                self.output
+                    .as_ref()
+                    .ok_or_else(|| GfxError::Other("output target missing".into()))?
+                    .srv
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let blend = if direct_blend_native {
+            None
+        } else {
+            Some(
+                self.blend
+                    .as_ref()
+                    .ok_or_else(|| GfxError::Other("blend target missing".into()))?,
+            )
+        };
+        let scale_srv = if use_separable {
+            Some(
+                self.scale
+                    .as_ref()
+                    .ok_or_else(|| GfxError::Other("scale target missing".into()))?
+                    .srv
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let scale_rtv = if use_separable {
+            Some(
+                self.scale
+                    .as_ref()
+                    .ok_or_else(|| GfxError::Other("scale target missing".into()))?
+                    .rtv
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let flow_srv = self
+            .flow_smooth
+            .as_ref()
+            .map(|f| f.srv.clone())
+            .unwrap_or_else(|| current.srv.clone());
+        let flow_stats_srv = self
+            .flow
+            .as_ref()
+            .map(|f| f.srv.clone())
+            .unwrap_or_else(|| current.srv.clone());
+
+        let mut cb_horizontal = cb;
+        cb_horizontal.output_size = [
+            content_w as f32,
+            source_h as f32,
+            1.0 / content_w.max(1) as f32,
+            1.0 / source_h.max(1) as f32,
+        ];
+        cb_horizontal.source_size[0] = source_w as f32;
+        cb_horizontal.source_size[1] = source_h as f32;
+        cb_horizontal.source_size[2] = 1.0 / source_w.max(1) as f32;
+        cb_horizontal.source_size[3] = 1.0 / source_h.max(1) as f32;
+        cb_horizontal.params2[2] = 1.0;
+
+        let mut cb_vertical = cb;
+        cb_vertical.source_size = [
+            content_w as f32,
+            source_h as f32,
+            1.0 / content_w.max(1) as f32,
+            1.0 / source_h.max(1) as f32,
+        ];
+        cb_vertical.params2[2] = 2.0;
+        // The intermediate is stretched horizontally but has the original
+        // source height, so its own aspect ratio no longer describes the
+        // letterbox geometry. Carry the original source aspect explicitly.
+        cb_vertical.params2[3] = source_w.max(1) as f32 / source_h.max(1) as f32;
 
         let qp_slot = self.q_slot;
         unsafe {
@@ -883,39 +1308,181 @@ impl Renderer {
             self.ctx
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
 
-            // Pass 1: temporal composition + spatial reconstruction.
+            // Pass 1: temporal blend at source resolution. At native output
+            // this writes directly into the final path; otherwise it writes
+            // the source-resolution intermediate used by the scaler.
+            let blend_pass_rtv = if direct_blend_native {
+                if sharpen {
+                    output_rtv
+                        .clone()
+                        .ok_or_else(|| GfxError::Other("output target missing".into()))?
+                } else {
+                    rtv.clone()
+                }
+            } else {
+                blend
+                    .as_ref()
+                    .ok_or_else(|| GfxError::Other("blend target missing".into()))?
+                    .rtv
+                    .clone()
+            };
             self.ctx
-                .OMSetRenderTargets(Some(&[Some(output_rtv.clone())]), None);
+                .OMSetRenderTargets(Some(&[Some(blend_pass_rtv)]), None);
             self.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
-                Width: bb_w,
-                Height: bb_h,
+                Width: source_w as f32,
+                Height: source_h as f32,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
-            self.ctx
-                .ClearRenderTargetView(&output_rtv, &[0.0, 0.0, 0.0, 1.0]);
-            self.ctx.PSSetShader(&self.ps_compose, None);
+            self.ctx.PSSetShader(&self.ps_blend, None);
             self.ctx.PSSetShaderResources(
                 0,
                 Some(&[
                     Some(previous.srv.clone()),
                     Some(current.srv.clone()),
                     Some(flow_srv),
+                    Some(flow_stats_srv),
                 ]),
             );
             self.ctx.Draw(3, 0);
 
-            // Pass 2: contrast-adaptive sharpening into the swapchain.
-            self.ctx
-                .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-            self.ctx.PSSetShader(&self.ps_rcas, None);
-            self.ctx
-                .PSSetShaderResources(0, Some(&[Some(output_srv.clone())]));
-            self.ctx.Draw(3, 0);
+            // Pass 2: spatial reconstruction. The source is already in
+            // `blend`, never bind its RTV and SRV at the same time.
+            self.ctx.PSSetShader(&self.ps_upscale, None);
+            if direct_blend_native {
+                // Already at the final resolution. Skip the reconstruction
+                // pass entirely; RCAS below (if enabled) reads the blend
+                // intermediate directly.
+            } else if use_separable {
+                // Horizontal pass -> compact intermediate at source height.
+                self.ctx.UpdateSubresource(
+                    &self.cbuf,
+                    0,
+                    None,
+                    &cb_horizontal as *const PerFrame as *const core::ffi::c_void,
+                    0,
+                    0,
+                );
+                self.ctx.OMSetRenderTargets(
+                    Some(&[Some(scale_rtv.clone().ok_or_else(|| {
+                        GfxError::Other("scale target missing".into())
+                    })?)]),
+                    None,
+                );
+                self.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: content_w as f32,
+                    Height: source_h as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                }]));
+                self.ctx.PSSetShaderResources(
+                    0,
+                    Some(&[Some(
+                        blend
+                            .as_ref()
+                            .ok_or_else(|| GfxError::Other("blend target missing".into()))?
+                            .srv
+                            .clone(),
+                    )]),
+                );
+                self.ctx.Draw(3, 0);
 
-            // Pass 3: premultiplied-alpha, scissored real-time HUD.
+                // Vertical/final pass. Binding the next target first releases
+                // the scale RTV; only then is scale.srv allowed to be read.
+                self.ctx.UpdateSubresource(
+                    &self.cbuf,
+                    0,
+                    None,
+                    &cb_vertical as *const PerFrame as *const core::ffi::c_void,
+                    0,
+                    0,
+                );
+                self.ctx.OMSetRenderTargets(
+                    Some(&[Some(if sharpen {
+                        output_rtv
+                            .clone()
+                            .ok_or_else(|| GfxError::Other("output target missing".into()))?
+                    } else {
+                        rtv.clone()
+                    })]),
+                    None,
+                );
+                self.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: bb_w,
+                    Height: bb_h,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                }]));
+                self.ctx.PSSetShaderResources(
+                    0,
+                    Some(&[Some(scale_srv.clone().ok_or_else(|| {
+                        GfxError::Other("scale target missing".into())
+                    })?)]),
+                );
+                self.ctx.Draw(3, 0);
+            } else {
+                self.ctx.UpdateSubresource(
+                    &self.cbuf,
+                    0,
+                    None,
+                    &cb as *const PerFrame as *const core::ffi::c_void,
+                    0,
+                    0,
+                );
+                self.ctx.OMSetRenderTargets(
+                    Some(&[Some(if sharpen {
+                        output_rtv
+                            .clone()
+                            .ok_or_else(|| GfxError::Other("output target missing".into()))?
+                    } else {
+                        rtv.clone()
+                    })]),
+                    None,
+                );
+                self.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: bb_w,
+                    Height: bb_h,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                }]));
+                self.ctx.PSSetShaderResources(
+                    0,
+                    Some(&[Some(
+                        blend
+                            .as_ref()
+                            .ok_or_else(|| GfxError::Other("blend target missing".into()))?
+                            .srv
+                            .clone(),
+                    )]),
+                );
+                self.ctx.Draw(3, 0);
+            }
+
+            // Final contrast-adaptive sharpening into the swapchain. The RCAS
+            // target must be bound before output.srv as input for the same
+            // simultaneous-view reason as above.
+            if sharpen {
+                self.ctx
+                    .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+                self.ctx.PSSetShader(&self.ps_rcas, None);
+                self.ctx.PSSetShaderResources(
+                    0,
+                    Some(&[Some(output_srv.clone().ok_or_else(|| {
+                        GfxError::Other("output target missing".into())
+                    })?)]),
+                );
+                self.ctx.Draw(3, 0);
+            }
+
+            // Pass 4: premultiplied-alpha, scissored real-time HUD.
             if let Some(text) = hud_text {
                 let style_key = (hud.font_scale, hud.background_alpha);
                 let style_changed = self.hud_last_style != Some(style_key);
@@ -958,7 +1525,7 @@ impl Renderer {
             }
 
             self.ctx.End(&self.queries[qp_slot].end);
-            let null_srvs: [Option<ID3D11ShaderResourceView>; 3] = [None, None, None];
+            let null_srvs: [Option<ID3D11ShaderResourceView>; 4] = [None, None, None, None];
             self.ctx.PSSetShaderResources(0, Some(&null_srvs));
         }
         self.queries[qp_slot].valid = true;
@@ -1010,5 +1577,34 @@ impl Renderer {
                 self.gpu_us = ((end - start) as f32 / disjoint.Frequency as f32) * 1e6;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content_dimensions;
+
+    #[test]
+    fn same_aspect_preserves_the_whole_output() {
+        assert_eq!(
+            content_dimensions(1920, 1080, 2560, 1440, true),
+            (2560, 1440)
+        );
+        assert_eq!(content_dimensions(1920, 1080, 1280, 720, true), (1280, 720));
+    }
+
+    #[test]
+    fn letterbox_preserves_source_aspect() {
+        // 4:3 content in a square output: 128x96 centered vertically.
+        assert_eq!(content_dimensions(32, 24, 128, 128, true), (128, 96));
+        // Ultrawide content in 16:9: 2560x1080 content plus bars.
+        assert_eq!(
+            content_dimensions(2560, 1080, 2560, 1440, true),
+            (2560, 1080)
+        );
+        assert_eq!(
+            content_dimensions(2560, 1080, 2560, 1440, false),
+            (2560, 1440)
+        );
     }
 }

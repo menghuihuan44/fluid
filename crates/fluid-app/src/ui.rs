@@ -653,7 +653,7 @@ impl eframe::App for FluidApp {
                         );
                         ui.add_enabled(
                             self.cfg.fg.enabled,
-                            egui::Slider::new(&mut self.cfg.fg.max_multiplier, 2..=4)
+                            egui::Slider::new(&mut self.cfg.fg.max_multiplier, 2..=8)
                                 .text("最高插帧倍率（相对源帧率）"),
                         );
                         ui.weak("只有当源帧率明显低于显示器刷新率时才会真正插值。");
@@ -676,10 +676,10 @@ impl eframe::App for FluidApp {
                             }
                         }
                         ui.weak(
-                            "提高强度更流畅但可能更多伪影；提高保护更保守但可能更容易回退真实帧。",
+                            "提高强度会更积极采用插值；低置信度、遮挡和场景切换像素始终回退真实当前帧。",
                         );
-                        ui.weak("纯外部插帧需要等待前后两帧，会额外增加约半个采集间隔的延迟。");
-                        ui.weak("实际倍率看 HUD 的 effective 值（输出 fps / 采集 fps）。");
+                        ui.weak("纯外部插帧需要等待前后两帧；倍率越高，为凑齐相位所需的回看延迟越大。");
+                        ui.weak("实际倍率看 HUD 的 target / effective 值（target 已按刷新率封顶）。");
                     });
 
                     ui.group(|ui| {
@@ -912,6 +912,19 @@ impl eframe::App for FluidApp {
                                 ui.end_row();
                                 ui.label("生成帧率");
                                 ui.label(format!("{:.1} fps", stats.generated_fps()));
+                                ui.end_row();
+                                ui.label("目标倍率 / 实际倍率");
+                                let target = stats
+                                    .fg_target_multiplier_x100
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    as f64
+                                    / 100.0;
+                                let actual = if stats.capture_fps() > 0.1 {
+                                    stats.present_fps() / stats.capture_fps()
+                                } else {
+                                    1.0
+                                };
+                                ui.label(format!("{target:.1}x / {actual:.1}x"));
                                 ui.end_row();
                                 ui.label("已生成帧");
                                 ui.label(format!(

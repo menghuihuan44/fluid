@@ -179,12 +179,16 @@ impl Default for HudConfig {
 pub struct FgConfig {
     pub enabled: bool,
     pub motion_compensation: bool,
-    /// 0..=100 interpolation contribution.
+    /// 0..=100 interpolation confidence gate. Higher values keep the
+    /// interpolated result across more of the confidence range; low-confidence,
+    /// occluded and scene-cut pixels always fall back to the real current frame.
     pub strength: u8,
     /// 0..=100 scene-cut/occlusion protection. Higher values fall back more
     /// readily to the real current frame.
     pub scene_protection: u8,
-    /// Cap generated output at this multiple of the source frame rate.
+    /// Requested output/source rate multiple. It is capped by display refresh
+    /// and by available source frames; the renderer never invents extra source
+    /// content.
     pub max_multiplier: u8,
 }
 

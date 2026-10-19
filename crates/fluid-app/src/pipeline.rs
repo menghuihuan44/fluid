@@ -157,6 +157,10 @@ fn thread_main(shared: Arc<SharedState>, rx: mpsc::Receiver<Command>, init_cfg: 
                 active = false;
                 paused = false;
                 shared.stats.fg_active.store(0, Ordering::Relaxed);
+                shared
+                    .stats
+                    .fg_target_multiplier_x100
+                    .store(0, Ordering::Relaxed);
                 shared.set_state(RunState::Idle, "");
                 continue;
             }
@@ -231,6 +235,10 @@ fn thread_main(shared: Arc<SharedState>, rx: mpsc::Receiver<Command>, init_cfg: 
         if paused {
             s.hide_overlay();
             shared.stats.fg_active.store(0, Ordering::Relaxed);
+            shared
+                .stats
+                .fg_target_multiplier_x100
+                .store(0, Ordering::Relaxed);
             shared.set_state(RunState::Paused, "");
             std::thread::sleep(Duration::from_millis(50));
             continue;
@@ -264,6 +272,46 @@ fn sleep_until(deadline: Instant) {
         } else {
             std::thread::yield_now();
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FgPacing {
+    /// Number of output presents per source frame that the display and the
+    /// user multiplier actually permit. It is <= the configured multiplier.
+    effective_multiplier: f64,
+    /// Time between generated/real output presents.
+    output_period: Duration,
+    /// How far behind real time the interpolation clock runs. For an exact
+    /// N-times schedule this makes the N-1 interpolated slots land at phases
+    /// 1/N .. (N-1)/N instead of repeatedly hitting an endpoint.
+    lookback: Duration,
+}
+
+impl FgPacing {
+    fn new(capture_interval_us: f64, refresh_hz: f32, requested_multiplier: u8) -> Self {
+        let requested = requested_multiplier.clamp(2, 8) as f64;
+        let capture_interval =
+            Duration::from_secs_f64((capture_interval_us.max(1_000.0) * 1.0e-6).min(1.0));
+        let display_period = Duration::from_secs_f64(1.0 / refresh_hz.clamp(24.0, 1_000.0) as f64);
+        let requested_period = capture_interval.div_f64(requested);
+        let output_period = display_period.max(requested_period);
+        let effective_multiplier = (capture_interval.as_secs_f64()
+            / output_period.as_secs_f64().max(1.0e-9))
+        .clamp(1.0, requested);
+        // At the effective multiplier M, delay the interpolation clock by
+        // (M-1)/M of a source interval. A fresh capture then exposes phases
+        // 1/M, 2/M, ... and uses every one of the M-1 interior slots.
+        let lookback = capture_interval.mul_f64((1.0 - 1.0 / effective_multiplier).max(0.0));
+        Self {
+            effective_multiplier,
+            output_period,
+            lookback,
+        }
+    }
+
+    fn allows_generation(self) -> bool {
+        self.effective_multiplier >= 1.35
     }
 }
 
@@ -305,7 +353,15 @@ struct Session {
     overload_count: u32,
     fg_underperf_count: u32,
     fg_low_gain_count: u32,
+    /// Graduated performance fallback: 0 = full quality, 1 = sharpening off,
+    /// 2 = sharpening + motion search off (bilinear scale).
+    fg_perf_stage: u32,
     fg_perf_until: Option<Instant>,
+    /// Last (prev seq, curr seq) pair that produced an interpolated present,
+    /// and the phase it was shown with. Display time must never move backwards
+    /// between presents of the same pair.
+    last_fg_pair: Option<(u64, u64)>,
+    last_fg_phase: f32,
     keep_overlay_below_taskbar: bool,
     freq: u64,
 }
@@ -322,7 +378,7 @@ impl Session {
         }
         let overlay = OverlayWindow::new(&bundle.device, &bundle.factory2, 64, 64)
             .map_err(|e| format!("overlay creation failed: {e}"))?;
-        let renderer = Renderer::new(&bundle.device, &bundle.ctx, 2)
+        let renderer = Renderer::new(&bundle.device, &bundle.ctx, 3)
             .map_err(|e| format!("renderer initialization failed: {e}"))?;
         Ok(Self {
             request,
@@ -362,7 +418,10 @@ impl Session {
             overload_count: 0,
             fg_underperf_count: 0,
             fg_low_gain_count: 0,
+            fg_perf_stage: 0,
             fg_perf_until: None,
+            last_fg_pair: None,
+            last_fg_phase: 0.0,
             keep_overlay_below_taskbar: false,
             freq: qpc_freq(),
         })
@@ -387,10 +446,10 @@ impl Session {
         self.overload_count = 0;
         self.fg_underperf_count = 0;
         self.fg_low_gain_count = 0;
+        self.fg_perf_stage = 0;
         self.fg_perf_until = None;
-        self.fg_underperf_count = 0;
-        self.fg_low_gain_count = 0;
-        self.fg_perf_until = None;
+        self.last_fg_pair = None;
+        self.last_fg_phase = 0.0;
         self.has_frame = false;
         self.dirty = true;
         self.next_tick = None;
@@ -426,7 +485,10 @@ impl Session {
         self.overload_count = 0;
         self.fg_underperf_count = 0;
         self.fg_low_gain_count = 0;
+        self.fg_perf_stage = 0;
         self.fg_perf_until = None;
+        self.last_fg_pair = None;
+        self.last_fg_phase = 0.0;
         self.monitor = -1;
         self.next_tick = None;
         self.last_capture_qpc = 0;
@@ -513,12 +575,28 @@ impl Session {
     fn invalidate_capture(&mut self) {
         self.dup = None;
         self.discard_wgc();
+        self.renderer.clear_frames();
+        self.shared.stats.fg_active.store(0, Ordering::Relaxed);
+        self.shared
+            .stats
+            .fg_target_multiplier_x100
+            .store(0, Ordering::Relaxed);
+        self.last_fg_pair = None;
+        self.last_fg_phase = 0.0;
         self.dirty = true;
         self.has_frame = false;
     }
 
     fn reset_for_target_change(&mut self) {
         self.discard_wgc();
+        self.renderer.clear_frames();
+        self.shared.stats.fg_active.store(0, Ordering::Relaxed);
+        self.shared
+            .stats
+            .fg_target_multiplier_x100
+            .store(0, Ordering::Relaxed);
+        self.last_fg_pair = None;
+        self.last_fg_phase = 0.0;
         self.has_frame = false;
         self.dirty = true;
         self.last_capture_qpc = 0;
@@ -669,6 +747,10 @@ impl Session {
                 } else {
                     self.fg_underperf_count = 0;
                 }
+                // Graduated degradation: first give up sharpening (cheap pass),
+                // then the motion search, before pausing generation entirely.
+                // Each stage holds for 10 s so a transient spike does not
+                // permanently downgrade quality.
                 if self.fg_underperf_count >= 2
                     && self
                         .fg_perf_until
@@ -676,9 +758,20 @@ impl Session {
                 {
                     self.fg_perf_until = Some(Instant::now() + Duration::from_secs(10));
                     self.fg_underperf_count = 0;
-                    tracing::warn!(
-                        "frame generation performance fallback enabled: disabling motion search and sharpening temporarily to approach the refresh-rate target"
-                    );
+                    match self.fg_perf_stage {
+                        0 => {
+                            self.fg_perf_stage = 1;
+                            tracing::warn!(
+                                "frame generation performance fallback stage 1: sharpening disabled for 10s to approach the refresh-rate target"
+                            );
+                        }
+                        _ => {
+                            self.fg_perf_stage = 2;
+                            tracing::warn!(
+                                "frame generation performance fallback stage 2: motion search and sharpening disabled for 10s to approach the refresh-rate target"
+                            );
+                        }
+                    }
                 }
                 if cap > 5.0 && out > 0.0 && out / cap < 1.15 {
                     self.fg_low_gain_count = self.fg_low_gain_count.saturating_add(1);
@@ -696,16 +789,29 @@ impl Session {
                 self.fg_underperf_count = 0;
                 self.fg_low_gain_count = 0;
             }
-            let perf_active = self
+            if self
                 .fg_perf_until
-                .is_some_and(|until| Instant::now() < until);
+                .is_some_and(|until| Instant::now() >= until)
+            {
+                self.fg_perf_stage = 0;
+            }
             self.shared
                 .stats
                 .fg_perf_fallback
-                .store(u32::from(perf_active), Ordering::Relaxed);
+                .store(self.fg_perf_stage, Ordering::Relaxed);
         }
 
         self.sample_system_metrics();
+
+        // Pace before polling the capture API, not after. Sleeping first means
+        // the WGC/DDA acquire immediately before rendering observes the newest
+        // completed source frame instead of a frame from before the sleep.
+        // That removes up to one output period of avoidable input latency and
+        // gives the frame-generation pair selector fresher endpoints.
+        if let Some(next) = self.next_tick {
+            self.set_stage(STAGE_PACE);
+            sleep_until(next);
+        }
 
         let mut active_window: Option<HWND> = None;
         let mut fallback_monitor: Option<isize> = None;
@@ -907,6 +1013,9 @@ impl Session {
                                     "WGC frame ring allocation failed: {e}"
                                 ))
                             })?;
+                        self.renderer.clear_frames();
+                        self.last_fg_pair = None;
+                        self.last_fg_phase = 0.0;
                         self.wgc_target_size = Some((capture.width(), capture.height()));
                         self.wgc = Some(capture);
                         if is_monitor {
@@ -974,6 +1083,9 @@ impl Session {
                             .map_err(|e| {
                                 TickErr::Recoverable(format!("WGC frame ring resize failed: {e}"))
                             })?;
+                        self.renderer.clear_frames();
+                        self.last_fg_pair = None;
+                        self.last_fg_phase = 0.0;
                         self.wgc_target_size = Some((target_w, target_h));
                         self.pending_target_size = None;
                         self.has_frame = false;
@@ -1011,6 +1123,9 @@ impl Session {
                     self.renderer.ensure_ring(dw, dh, d.format()).map_err(|e| {
                         TickErr::Recoverable(format!("frame ring allocation failed: {e}"))
                     })?;
+                    self.renderer.clear_frames();
+                    self.last_fg_pair = None;
+                    self.last_fg_phase = 0.0;
                     self.dup = Some(d);
                     self.monitor = source_monitor;
                     self.dda_retry_after = None;
@@ -1238,13 +1353,11 @@ impl Session {
 
         let refresh_interval_us = 1_000_000.0 / self.refresh_hz.max(24.0) as f64;
         let frame_period = Duration::from_secs_f64(1.0 / self.refresh_hz.max(24.0) as f64);
-
-        // Always pace the loop before deciding whether to render. Without this,
-        // skipping unchanged frames would spin the CPU at full speed.
-        if let Some(next) = self.next_tick {
-            self.set_stage(STAGE_PACE);
-            sleep_until(next);
-        }
+        let fg_pacing = FgPacing::new(
+            self.capture_interval_us,
+            self.refresh_hz,
+            cfg.fg.max_multiplier,
+        );
 
         let latest_now = self.renderer.latest_snapshot();
         let now_before = qpc_now();
@@ -1272,6 +1385,7 @@ impl Session {
             && cfg.fg.strength > 0
             && cfg.fg.max_multiplier >= 2
             && capture_ratio >= 1.35
+            && fg_pacing.allows_generation()
             && enough_frames
             && !source_stalled
             && self
@@ -1281,6 +1395,14 @@ impl Session {
             .stats
             .fg_active
             .store(u32::from(fg_eligible), Ordering::Relaxed);
+        self.shared.stats.fg_target_multiplier_x100.store(
+            if fg_eligible {
+                (fg_pacing.effective_multiplier * 100.0).round() as u32
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
         // If nothing changed and no interpolated output is due, keep the last
         // presented swapchain image. This avoids pointless GPU work on a static
         // source and when interpolation is disabled.
@@ -1297,24 +1419,28 @@ impl Session {
             None => return Err(TickErr::Recoverable("swapchain RTV unavailable".into())),
         };
 
-        // TEMP diagnostic: rely on Present backpressure instead of the waitable.
-        let present_slot_ready = true;
-        let waited_us = 0u32;
-        self.shared
-            .stats
-            .present_wait_us
-            .store(0, Ordering::Relaxed);
-        if !present_slot_ready {
-            tracing::debug!("present slot wait timed out after {waited_us}us");
-            if self.shared.stats.frame_index.load(Ordering::Relaxed) > 0 {
-                self.shared
-                    .stats
-                    .dropped_frames
-                    .fetch_add(1, Ordering::Relaxed);
-                self.next_tick = Some(Instant::now() + Duration::from_millis(1));
-                return Ok(());
+        // MaximumFrameLatency=1 is only an upper bound; if the compositor is
+        // late, presenting again immediately queues work and raises latency.
+        // Wait for a free frame slot only once this tick is known to present,
+        // so static/paused ticks never consume the waitable signal needlessly.
+        if self.overlay.is_visible() {
+            let budget_us =
+                (1_000_000.0 / self.refresh_hz.max(24.0) as f64 * 0.5).clamp(500.0, 4_000.0) as u32;
+            let wait_started = Instant::now();
+            let ready = self.overlay.wait_present_slot(budget_us);
+            let waited_us = wait_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+            self.shared
+                .stats
+                .present_wait_us
+                .store(waited_us, Ordering::Relaxed);
+            if !ready {
+                tracing::trace!("present slot wait timed out after {waited_us}us");
             }
         }
+        // Use the post-wait presentation instant as the phase reference rather
+        // than the moment frame acquisition happened to finish. `now_qpc` is
+        // sampled separately and still reports true end-to-end latency.
+        let scheduled_present_qpc = qpc_now();
         let now_qpc = qpc_now();
 
         let latest =
@@ -1322,17 +1448,31 @@ impl Session {
 
         let mut fg_phase = 1.0f32;
         let (previous, current) = if fg_eligible {
-            let half_interval_ticks =
-                (self.capture_interval_us * 1.0e-6 * self.freq as f64 * 0.5) as i64;
-            let target_qpc = now_qpc.saturating_sub(half_interval_ticks);
+            let lookback_ticks =
+                (fg_pacing.lookback.as_secs_f64() * self.freq as f64).round() as i64;
+            let target_qpc = scheduled_present_qpc
+                .min(now_qpc)
+                .saturating_sub(lookback_ticks);
             match self.renderer.pair_at_time(target_qpc) {
                 Some((prev, curr, phase)) => {
-                    fg_phase = phase;
+                    // Display time must never move backwards between presents
+                    // of the same source pair: a late tick or a jittery frame
+                    // arrival would otherwise show a briefly "younger" frame
+                    // and read as a stutter.
+                    let pair_key = (prev.seq, curr.seq);
+                    if self.last_fg_pair == Some(pair_key) && phase < self.last_fg_phase {
+                        fg_phase = self.last_fg_phase.min(0.999);
+                    } else {
+                        fg_phase = phase;
+                    }
+                    self.last_fg_pair = Some(pair_key);
+                    self.last_fg_phase = fg_phase;
                     (prev, curr)
                 }
                 None => (latest.clone(), latest),
             }
         } else {
+            self.last_fg_pair = None;
             (latest.clone(), latest)
         };
 
@@ -1351,10 +1491,15 @@ impl Session {
                 .generated_frames
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let perf_fallback = self
+        let perf_stage = if self
             .fg_perf_until
-            .is_some_and(|until| Instant::now() < until);
-        let scale_mode = if perf_fallback {
+            .is_some_and(|until| Instant::now() < until)
+        {
+            self.fg_perf_stage
+        } else {
+            0
+        };
+        let scale_mode = if perf_stage >= 2 {
             1
         } else {
             match cfg.scale.mode {
@@ -1365,13 +1510,13 @@ impl Session {
         };
         let options = RenderOptions {
             scale_mode,
-            sharpness: if perf_fallback {
+            sharpness: if perf_stage >= 1 {
                 0.0
             } else {
                 cfg.scale.sharpness.min(100) as f32 / 100.0
             },
             fg_enabled: fg_eligible,
-            motion_compensation: cfg.fg.motion_compensation && !perf_fallback,
+            motion_compensation: cfg.fg.motion_compensation && perf_stage < 2,
             preserve_aspect: cfg.scale.preserve_aspect,
             fg_strength: cfg.fg.strength.min(100) as f32 / 100.0,
             scene_protection: cfg.fg.scene_protection.min(100) as f32 / 100.0,
@@ -1462,16 +1607,30 @@ impl Session {
         }
         self.last_present_tick = Some(now_instant);
         let next_period = if fg_eligible {
-            let multiplier = cfg.fg.max_multiplier.clamp(2, 8) as f64;
-            let desired = Duration::from_secs_f64((self.capture_interval_us * 1.0e-6) / multiplier);
-            frame_period.max(desired)
+            fg_pacing.output_period
         } else {
             frame_period
         };
+        // Absolute output grid: the schedule advances in whole periods from the
+        // previous planned instant. A late present no longer pushes every
+        // future present later (the old `now + period` re-anchor accumulated
+        // drift and quietly reduced the output rate); fully missed slots are
+        // accounted as dropped output frames instead.
         let cadence_base = self.next_tick.unwrap_or(now_instant);
         let mut next = cadence_base + next_period;
-        if next < now_instant {
-            next = now_instant + next_period;
+        if next <= now_instant {
+            let late_periods =
+                ((now_instant - next).as_secs_f64() / next_period.as_secs_f64()).floor() as u32;
+            if late_periods > 0 {
+                self.shared
+                    .stats
+                    .dropped_frames
+                    .fetch_add(late_periods.min(8), Ordering::Relaxed);
+            }
+            next += next_period * (late_periods.min(8) + 1);
+            if next <= now_instant {
+                next = now_instant + next_period;
+            }
         }
         self.next_tick = Some(next);
         Stats::ema_x100(
@@ -1502,5 +1661,84 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.discard_wgc();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn phase_after_arrival(pacing: FgPacing, source_period: Duration, slots: usize) -> Vec<f32> {
+        // A capture arrives at t=source_period; output slots advance from
+        // there. The interpolation clock is target = t - lookback.
+        (0..slots)
+            .map(|slot| {
+                let now = source_period + pacing.output_period.mul_f64(slot as f64);
+                let target = now.saturating_sub(pacing.lookback);
+                (target.as_secs_f64() / source_period.as_secs_f64()).clamp(0.0, 1.0) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exact_2x_schedule_uses_one_interior_slot_per_source_frame() {
+        let source_us = 1_000_000.0 / 60.0;
+        let p = FgPacing::new(source_us, 120.0, 2);
+        assert!((p.effective_multiplier - 2.0).abs() < 0.01);
+        let phases = phase_after_arrival(p, Duration::from_secs_f64(1.0 / 60.0), 2);
+        assert!((phases[0] - 0.5).abs() < 0.01, "{phases:?}");
+        assert!((phases[1] - 1.0).abs() < 0.01, "{phases:?}");
+    }
+
+    #[test]
+    fn exact_3x_schedule_uses_two_interior_slots_per_source_frame() {
+        let source_us = 1_000_000.0 / 60.0;
+        let p = FgPacing::new(source_us, 180.0, 3);
+        assert!((p.effective_multiplier - 3.0).abs() < 0.01);
+        let phases = phase_after_arrival(p, Duration::from_secs_f64(1.0 / 60.0), 3);
+        for (i, expected) in [1.0 / 3.0, 2.0 / 3.0, 1.0].into_iter().enumerate() {
+            assert!((phases[i] - expected).abs() < 0.01, "{phases:?}");
+        }
+    }
+
+    #[test]
+    fn each_stable_source_interval_emits_all_interior_slots() {
+        // Simulate the pair selector directly: a source frame arrives every
+        // interval, and M output slots follow it. With the lookback from
+        // FgPacing the phases must be 1/M .. M/M, i.e. exactly M-1 generated
+        // frames plus one real endpoint per interval.
+        for multiplier in 2..=4u8 {
+            let source_us = 1_000_000.0 / 60.0;
+            let source_period = Duration::from_secs_f64(source_us * 1.0e-6);
+            let p = FgPacing::new(source_us, (60 * multiplier) as f32, multiplier);
+            let mut generated = 0u32;
+            for interval in 1..=120u32 {
+                let interval_start = source_period.mul_f64(interval as f64);
+                for slot in 0..multiplier as u32 {
+                    let now = interval_start + p.output_period.mul_f64(slot as f64);
+                    let target = now.saturating_sub(p.lookback);
+                    let phase = target.as_secs_f64() / source_period.as_secs_f64();
+                    let phase_f = phase - phase.floor();
+                    if phase_f > 0.001 && phase_f < 0.999 {
+                        generated += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                generated,
+                120 * (multiplier as u32 - 1),
+                "multiplier {multiplier}"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_rate_caps_the_requested_multiplier() {
+        // 60 FPS source on a 144 Hz display can present at most 2.4x even if
+        // the user asks for 4x. The schedule must report the attainable rate
+        // instead of pretending that dropped slots were generated.
+        let p = FgPacing::new(1_000_000.0 / 60.0, 144.0, 4);
+        assert!((p.effective_multiplier - 2.4).abs() < 0.01);
+        assert_eq!(p.output_period, Duration::from_secs_f64(1.0 / 144.0));
     }
 }

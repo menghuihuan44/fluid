@@ -236,12 +236,25 @@ fn read_back(
     }
 }
 
-/// Exercise the compute motion estimator, temporal compose pass and RCAS pass
-/// on WARP. This is the regression test for the frame-generation path.
+/// Exercise the compute motion estimator, temporal blend pass, adaptive
+/// scaling and RCAS pass on WARP. This is the regression test for the
+/// frame-generation path: with a checkerboard that moves 2 px per source
+/// frame, a phase-0.5 blend must move the content by 1 px (half the motion)
+/// rather than showing either endpoint.
 pub fn render_motion_interpolation() -> Result<(), String> {
     let bundle = create_device_with_driver(None, D3D_DRIVER_TYPE_WARP)
         .map_err(|e| format!("WARP device creation failed: {e}"))?;
     let (w, h) = (64u32, 64u32);
+    // 4-px checker: every 8x8 estimator patch crosses block boundaries, so
+    // motion is measurable on the whole grid.
+    let block = 4u32;
+    let checker_at = |x: u32, y: u32| -> u8 {
+        if ((x / block) + (y / block)) & 1 == 0 {
+            230
+        } else {
+            35
+        }
+    };
 
     let mut a = vec![0u8; (w * h * 4) as usize];
     let mut b = vec![0u8; (w * h * 4) as usize];
@@ -250,15 +263,15 @@ pub fn render_motion_interpolation() -> Result<(), String> {
             let ia = ((y * w + x) * 4) as usize;
             let bx = (x + 2) % w;
             let ib = ((y * w + bx) * 4) as usize;
-            let checker = (((x / 8) + (y / 8)) & 1) as u8;
-            let color = if checker == 0 { 230 } else { 35 };
+            let color = checker_at(x, y);
             a[ia] = color / 2;
             a[ia + 1] = color;
             a[ia + 2] = color / 3;
             a[ia + 3] = 255;
-            b[ib] = color / 2;
-            b[ib + 1] = color;
-            b[ib + 2] = color / 3;
+            let color_b = checker_at(bx, y);
+            b[ib] = color_b / 2;
+            b[ib + 1] = color_b;
+            b[ib + 2] = color_b / 3;
             b[ib + 3] = 255;
         }
     }
@@ -307,7 +320,7 @@ pub fn render_motion_interpolation() -> Result<(), String> {
     }
     let opts = crate::renderer::RenderOptions {
         scale_mode: 2,
-        sharpness: 0.4,
+        sharpness: 0.0,
         fg_enabled: true,
         motion_compensation: true,
         preserve_aspect: true,
@@ -343,6 +356,259 @@ pub fn render_motion_interpolation() -> Result<(), String> {
     }
     if !any_color {
         return Err("motion test rendered a black frame".into());
+    }
+
+    // Input B is A translated right by two pixels, so the estimator must emit
+    // a +2 source-pixel vector. At phase 0.5 the correct content at pixel x is
+    // A(x-1). Judge the one-column-wide pixels where A(x-1) differs from both
+    // the current frame, B(x)=A(x-2), and the unwarped endpoint average.
+    let mut verified = 0u32;
+    for y in [1u32, 5, 9, 13] {
+        for x in (5u32..w).step_by(4) {
+            let warped = checker_at(x - 1, y);
+            let current = checker_at(x - 2, y);
+            let no_motion = 0.5 * (checker_at(x, y) as f32 + current as f32);
+            if (warped as f32 - current as f32).abs() < 80.0
+                || (warped as f32 - no_motion).abs() < 30.0
+            {
+                continue;
+            }
+            let i = ((y * w + x) * 4) as usize;
+            let g = pixels[i + 1] as i32;
+            let d_warped = (g - warped as i32).abs();
+            let d_current = (g - current as i32).abs();
+            let d_no_motion = (g as f32 - no_motion).abs() as i32;
+            if d_warped >= d_current || d_warped >= d_no_motion {
+                return Err(format!(
+                    "interpolated pixel ({x},{y}) G={g} does not follow motion \
+                     (warped={warped}, current={current}, no_motion={no_motion:.1})"
+                ));
+            }
+            verified += 1;
+        }
+    }
+    if verified < 4 {
+        return Err(format!(
+            "motion test found only {verified} judgeable pixels; pattern too small"
+        ));
+    }
+    tracing::info!("motion interpolation selftest passed ({verified} pixels verified)");
+    Ok(())
+}
+
+/// A hard scene cut has no valid motion. The blend must fall back to the real
+/// current frame instead of averaging two unrelated images into a ghosted or
+/// purple mid-frame.
+pub fn render_scene_cut_fallback() -> Result<(), String> {
+    let bundle = create_device_with_driver(None, D3D_DRIVER_TYPE_WARP)
+        .map_err(|e| format!("WARP device creation failed: {e}"))?;
+    let (w, h) = (32u32, 32u32);
+    let red = [10u8, 20, 230, 255].repeat((w * h) as usize);
+    let blue = [230u8, 20, 10, 255].repeat((w * h) as usize);
+    let tex_a = make_source_texture(&bundle.device, &red, w, h)?;
+    let tex_b = make_source_texture(&bundle.device, &blue, w, h)?;
+
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut rt = None;
+    unsafe { bundle.device.CreateTexture2D(&desc, None, Some(&mut rt)) }
+        .map_err(|e| format!("scene-cut RT: {e}"))?;
+    let rt = rt.unwrap();
+    let mut rtv = None;
+    unsafe {
+        bundle
+            .device
+            .CreateRenderTargetView(&rt, None, Some(&mut rtv))
+    }
+    .map_err(|e| format!("scene-cut RTV: {e}"))?;
+    let rtv = rtv.unwrap();
+
+    let mut renderer = Renderer::new(&bundle.device, &bundle.ctx, 3).map_err(|e| e.to_string())?;
+    renderer
+        .ensure_ring(w, h, DXGI_FORMAT_B8G8R8A8_UNORM)
+        .map_err(|e| e.to_string())?;
+    renderer.push_frame(&tex_a, 1_000);
+    renderer.push_frame(&tex_b, 2_000);
+    let (prev, curr, phase) = renderer
+        .pair_at_time(1_500)
+        .ok_or_else(|| "scene-cut test could not select frame pair".to_string())?;
+    renderer
+        .render(crate::renderer::RenderRequest {
+            target: crate::renderer::RenderTargetInfo {
+                rtv: &rtv,
+                width: w as f32,
+                height: h as f32,
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+            },
+            previous: &prev,
+            current: &curr,
+            options: crate::renderer::RenderOptions {
+                scale_mode: 2,
+                sharpness: 0.0,
+                fg_enabled: true,
+                motion_compensation: true,
+                preserve_aspect: true,
+                fg_strength: 0.9,
+                scene_protection: 0.8,
+                fg_phase: phase,
+            },
+            hud_text: None,
+            hud: crate::renderer::HudOptions::default(),
+        })
+        .map_err(|e| e.to_string())?;
+
+    let pixels = read_back(&bundle.device, &bundle.ctx, &rt, w, h)?;
+    let center = ((h / 2 * w + w / 2) * 4) as usize;
+    let (b, g, r, a) = (
+        pixels[center],
+        pixels[center + 1],
+        pixels[center + 2],
+        pixels[center + 3],
+    );
+    if a != 255 {
+        return Err(format!("scene-cut fallback alpha={a}"));
+    }
+    // The real current frame is blue. A ghosted blend would move R up and B
+    // down toward the red previous frame.
+    if r > 40 || b < 200 || g > 50 {
+        return Err(format!(
+            "scene cut was blended instead of falling back to current: BGRA=({b},{g},{r},{a})"
+        ));
+    }
+    Ok(())
+}
+
+/// Exercise the two-pass separable adaptive upscaler and the letterbox path
+/// on WARP. A half-red/half-blue source is magnified into a square canvas; the
+/// resulting frame must keep both colours on the correct side and put black
+/// bars only outside the 4:3 content rectangle.
+pub fn render_adaptive_upscale() -> Result<(), String> {
+    let bundle = create_device_with_driver(None, D3D_DRIVER_TYPE_WARP)
+        .map_err(|e| format!("WARP device creation failed: {e}"))?;
+    let (src_w, src_h) = (32u32, 24u32);
+    let (out_w, out_h) = (128u32, 128u32);
+    let mut src_data = vec![0u8; (src_w * src_h * 4) as usize];
+    for y in 0..src_h {
+        for x in 0..src_w {
+            let i = ((y * src_w + x) * 4) as usize;
+            let (b, g, r) = if x < src_w / 2 {
+                (10, 20, 220)
+            } else {
+                (210, 30, 10)
+            };
+            src_data[i..i + 4].copy_from_slice(&[b, g, r, 255]);
+        }
+    }
+    let src = make_source_texture(&bundle.device, &src_data, src_w, src_h)?;
+
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: out_w,
+        Height: out_h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut rt = None;
+    unsafe { bundle.device.CreateTexture2D(&desc, None, Some(&mut rt)) }
+        .map_err(|e| format!("upscale RT: {e}"))?;
+    let rt = rt.unwrap();
+    let mut rtv = None;
+    unsafe {
+        bundle
+            .device
+            .CreateRenderTargetView(&rt, None, Some(&mut rtv))
+    }
+    .map_err(|e| format!("upscale RTV: {e}"))?;
+    let rtv = rtv.unwrap();
+
+    let mut renderer = Renderer::new(&bundle.device, &bundle.ctx, 3).map_err(|e| e.to_string())?;
+    renderer
+        .ensure_ring(src_w, src_h, DXGI_FORMAT_B8G8R8A8_UNORM)
+        .map_err(|e| e.to_string())?;
+    renderer.push_frame(&src, 1);
+    let sample = renderer
+        .latest_snapshot()
+        .ok_or_else(|| "upscale test frame ring is empty".to_string())?;
+    renderer
+        .render(crate::renderer::RenderRequest {
+            target: crate::renderer::RenderTargetInfo {
+                rtv: &rtv,
+                width: out_w as f32,
+                height: out_h as f32,
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+            },
+            previous: &sample,
+            current: &sample,
+            options: crate::renderer::RenderOptions {
+                scale_mode: 2,
+                sharpness: 0.3,
+                fg_enabled: false,
+                motion_compensation: false,
+                preserve_aspect: true,
+                fg_strength: 0.0,
+                scene_protection: 0.6,
+                fg_phase: 1.0,
+            },
+            hud_text: None,
+            hud: crate::renderer::HudOptions::default(),
+        })
+        .map_err(|e| e.to_string())?;
+
+    let pixels = read_back(&bundle.device, &bundle.ctx, &rt, out_w, out_h)?;
+    let pixel = |x: u32, y: u32| -> (u8, u8, u8, u8) {
+        let i = ((y * out_w + x) * 4) as usize;
+        (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3])
+    };
+    // The source colour boundary is exactly at x=16 of 32. After the 4x
+    // separable magnification it must land at output x=64; x=60/68 are one
+    // source pixel away and catch the historical half-/full-texel tap shift.
+    for (x, y, want_red) in [
+        (32u32, 64u32, true),
+        (60u32, 64u32, true),
+        (68u32, 64u32, false),
+        (96u32, 64u32, false),
+    ] {
+        let (b, g, r, a) = pixel(x, y);
+        if a != 255 {
+            return Err(format!("adaptive upscale alpha={a} at ({x},{y})"));
+        }
+        let ok = if want_red {
+            r > 180 && b < 50 && g < 60
+        } else {
+            b > 170 && r < 50 && g < 70
+        };
+        if !ok {
+            return Err(format!(
+                "adaptive upscale wrong colour at ({x},{y}): BGRA=({b},{g},{r},{a})"
+            ));
+        }
+    }
+    let (b, g, r, a) = pixel(out_w / 2, 4);
+    if a != 255 || b > 4 || g > 4 || r > 4 {
+        return Err(format!(
+            "adaptive upscale letterbox bar is not black at top: BGRA=({b},{g},{r},{a})"
+        ));
     }
     Ok(())
 }

@@ -27,6 +27,9 @@ pub struct Stats {
     /// 0 = Desktop Duplication monitor, 1 = Windows Graphics Capture window.
     pub capture_backend: AtomicU32,
     pub generated_fps_x100: AtomicU32,
+    /// Attainable output/source multiplier after capping by display refresh.
+    /// Zero when frame generation is inactive.
+    pub fg_target_multiplier_x100: AtomicU32,
     pub process_cpu_x100: AtomicU32,
     pub working_set_mb: AtomicU32,
     pub fg_phase_x1000: AtomicU32,
