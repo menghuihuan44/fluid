@@ -1,0 +1,14 @@
+[package]
+name = "fluid-interp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Frame interpolation (frame generation) for Fluid."
+
+[dependencies]
+fluid-core.workspace = true
+fluid-flow.workspace = true
+serde.workspace = true
+wide.workspace = true

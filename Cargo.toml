@@ -2,44 +2,76 @@
 resolver = "2"
 members = [
     "crates/fluid-core",
-    "crates/fluid-gfx",
+    "crates/fluid-flow",
+    "crates/fluid-interp",
+    "crates/fluid-upscale",
     "crates/fluid-capture",
-    "crates/fluid-app",
-    "crates/fluid-testkit",
+    "crates/fluid-present",
+    "crates/fluid-video",
+    "crates/fluid-engine",
+    "crates/fluid-cli",
+    "crates/fluid-gpu",
+    "crates/fluid-gui",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
-license = "MIT"
+edition = "2024"
+rust-version = "1.99"
+license = "AGPL-3.0-or-later"
+authors = ["Fluid contributors"]
+description = "Fluid - low-latency cross-platform frame generation and upscaling suite"
 
 [workspace.dependencies]
+fluid-core = { path = "crates/fluid-core" }
+fluid-flow = { path = "crates/fluid-flow" }
+fluid-interp = { path = "crates/fluid-interp" }
+fluid-upscale = { path = "crates/fluid-upscale" }
+fluid-capture = { path = "crates/fluid-capture" }
+fluid-present = { path = "crates/fluid-present" }
+fluid-video = { path = "crates/fluid-video" }
+fluid-engine = { path = "crates/fluid-engine" }
+fluid-gpu = { path = "crates/fluid-gpu" }
+
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
-directories = "5"
-thiserror = "2"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-parking_lot = "0.12"
-font8x8 = "0.3"
-eframe = "0.29"
-tray-icon = "0.19"
-
-[workspace.dependencies.fluid-core]
-path = "crates/fluid-core"
-
-[workspace.dependencies.fluid-gfx]
-path = "crates/fluid-gfx"
-
-[workspace.dependencies.fluid-capture]
-path = "crates/fluid-capture"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+# Portable SIMD wrappers (safe Rust, SSE2/NEON baselines): used by the algorithms'
+# hot loops. Same code path on x86_64 and aarch64, no unsafe in our crates.
+wide = "1"
+# Safe SIMD with runtime CPU-feature dispatch (AVX2/AVX-512/NEON) - lets one
+# source file be compiled once per ISA and picked at startup, no unsafe in our
+# crates. Used by the CPU upscale hot loops.
+pulp = "0.22"
+# Android-only plumbing for screen capture (MediaProjection via JNI) and
+# presentation (ANativeWindow). Never compiled for desktop targets.
+jni = { version = "0.22", default-features = false }
+ndk-sys = "0.6"
+# Desktop + Android GUI. Glow (OpenGL/GLES) renderer instead of wgpu keeps the
+# dependency tree and build time small; egui is immediate-mode so the whole UI
+# is plain Rust with no webview/JS bridge.
+# Same winit as eframe 0.37 pulls in; needed so the Android entry point can
+# name AndroidApp directly (eframe does not re-export winit).
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "android-game-activity"] }
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "accesskit",
+    "x11",
+    "wayland",
+    "android-game-activity",
+] }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+strip = "symbols"
 
-[profile.dev.package."*"]
-opt-level = 1
+# gpu-allocator 0.28 accepts windows 0.53..0.62; without this patch Cargo resolves it
+# against windows 0.58 (our Win32 backends) while wgpu-hal 30 D3D12 needs 0.62,
+# breaking the ID3D12* hand-off inside wgpu-hal. Pin the transitive copy to 0.62.
+[patch.crates-io]
+gpu-allocator = { path = "vendor/gpu-allocator" }

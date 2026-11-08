@@ -1,0 +1,34 @@
+[package]
+name = "fluid-present"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Cross-platform frame presentation backends for Fluid."
+
+[dependencies]
+fluid-core.workspace = true
+serde.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Minimally featured windows crate: Win32 window + GDI blit, plus the D3D11
+# and DXGI pieces the flip-model swap chain backend needs.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# ANativeWindow lock/unlockAndPost presentation from the NDK.
+jni.workspace = true
+ndk-sys = { workspace = true, features = ["nativewindow"] }
+

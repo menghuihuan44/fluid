@@ -1,0 +1,13 @@
+[package]
+name = "fluid-video"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Video and image-sequence frame sources for Fluid (y4m, PNG, rawvideo)."
+
+[dependencies]
+fluid-core.workspace = true
+serde.workspace = true
+image.workspace = true

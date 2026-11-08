@@ -1,404 +1,549 @@
-//! Window discovery and target-rectangle tracking.
+//! Window capture types and platform independent helpers.
 //!
-//! Only public Win32 window metadata is used. No target process handle is
-//! opened and no process memory is read.
+//! A window source captures one application window instead of a whole monitor.
+//! The public entry points live in the crate root ("enumerate_windows" and
+//! "open_window"); this module owns the data types plus the pure selection and
+//! geometry logic so it can be unit tested on every platform, including CI.
+//!
+//! Geometry: "WindowInfo" reports the window frame rectangle in physical
+//! desktop pixels (negative origins are normal on a secondary monitor that
+//! sits left of or above the primary one). "CaptureConfig::region" is
+//! interpreted as a crop *inside* the window: it is clipped to the captured
+//! content and "FrameSource::dims" reports the clipped size. Window sources
+//! always produce "Rgba8" frames.
+//!
+//! Follow behaviour: a window source tracks its target window. Moving the
+//! window does not change the captured content. Resizing the window keeps the
+//! output dimensions fixed at the size reported when the source was opened
+//! (the engine builds its pipeline from that size); content that no longer
+//! fits is cropped, content that became smaller is padded black. Reopen the
+//! source to adopt a new size.
+//!
+//! Liveness: a live window source never returns "Ok(None)". When the window is
+//! minimized, occluded, not repainting or already closed, the previous frame
+//! is replayed with a fresh timestamp and sequence number (see "replay").
 
-use fluid_core::config::WindowRef;
-use std::sync::atomic::{AtomicIsize, Ordering};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
-use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
-};
-use windows::Win32::Graphics::Gdi::ClientToScreen;
-use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    GA_ROOT, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-};
+use std::fmt;
 
-#[derive(Debug, Clone)]
-pub struct WinEnum {
-    pub hwnd: isize,
+// "FrameSource" is used by the fake window source in the test module below, so it
+// is only needed when tests are compiled; allow the import in library builds.
+#[cfg_attr(not(test), allow(unused_imports))]
+use fluid_core::{Dims, FluidError, Frame, FrameSource, PixelFormat, Rect, Result};
+
+/// A top-level application window that can be captured.
+///
+/// "id" is the native window handle stored as an integer; it is stable for the
+/// lifetime of the window and is what "WindowSelector::id" expects.
+/// "dims", "left" and "top" describe the window frame rectangle in physical
+/// desktop pixels (the frame includes the title bar and borders; the captured
+/// content can be slightly smaller, ask the opened source for its exact size).
+/// "process_name" is the executable file name, for example "notepad.exe".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub id: u64,
     pub title: String,
-    pub class: String,
-    pub rect: (i32, i32, i32, i32),
+    pub class_name: String,
+    pub process_name: String,
+    pub dims: Dims,
+    pub left: i32,
+    pub top: i32,
+    pub visible: bool,
+    pub minimized: bool,
 }
 
-impl WinEnum {
-    pub fn width(&self) -> i32 {
-        self.rect.2 - self.rect.0
-    }
-
-    pub fn height(&self) -> i32 {
-        self.rect.3 - self.rect.1
-    }
-
-    pub fn area(&self) -> i64 {
-        self.width() as i64 * self.height() as i64
-    }
-}
-
-pub fn hwnd_from_isize(v: isize) -> HWND {
-    HWND(v as *mut core::ffi::c_void)
-}
-
-pub fn is_window(hwnd: HWND) -> bool {
-    unsafe { IsWindow(hwnd).as_bool() }
-}
-
-pub fn is_iconic(hwnd: HWND) -> bool {
-    unsafe { IsIconic(hwnd).as_bool() }
-}
-
-/// DWM extended frame bounds, falling back to GetWindowRect for windows that
-/// do not expose DWM attributes (some games, launchers, and child render windows).
-pub fn window_bounds(hwnd: HWND) -> Option<RECT> {
-    let mut rect = RECT::default();
-    let dwm_ok = unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS,
-            &mut rect as *mut RECT as *mut core::ffi::c_void,
-            std::mem::size_of::<RECT>() as u32,
+impl fmt::Display for WindowInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}] {} {}x{} at ({}, {}) ({}){}",
+            self.id,
+            self.title,
+            self.dims.width,
+            self.dims.height,
+            self.left,
+            self.top,
+            self.process_name,
+            if self.minimized { " (minimized)" } else { "" }
         )
-        .is_ok()
-    };
-    if !dwm_ok || rect.right <= rect.left || rect.bottom <= rect.top {
-        rect = RECT::default();
-        if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
-            return None;
+    }
+}
+
+/// Which window "open_window" should capture.
+///
+/// "id" always wins when set. Otherwise every set field must match ("and"):
+/// "title_contains" is a case insensitive substring of the window title and
+/// "process" matches the executable name, with or without the ".exe" suffix.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowSelector {
+    pub id: Option<u64>,
+    pub title_contains: Option<String>,
+    pub process: Option<String>,
+}
+
+/// Rectangle in signed desktop or window local pixel coordinates.
+///
+/// "fluid_core::Rect" uses unsigned coordinates because it describes a frame
+/// buffer. Window geometry can be negative (a monitor placed left of the
+/// primary one), so window capture uses this signed variant internally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PixelRect {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl PixelRect {
+    pub(crate) const fn new(left: i32, top: i32, width: u32, height: u32) -> Self {
+        Self {
+            left,
+            top,
+            width,
+            height,
         }
     }
-    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
-}
 
-/// Kept as the public compatibility name used by the pipeline.
-pub fn extended_frame_bounds(hwnd: HWND) -> Option<RECT> {
-    window_bounds(hwnd)
-}
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
 
-fn is_cloaked(hwnd: HWND) -> bool {
-    let mut cloaked: u32 = 0;
-    unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED,
-            &mut cloaked as *mut u32 as *mut core::ffi::c_void,
-            std::mem::size_of::<u32>() as u32,
+    pub(crate) fn right(&self) -> i64 {
+        self.left as i64 + self.width as i64
+    }
+
+    pub(crate) fn bottom(&self) -> i64 {
+        self.top as i64 + self.height as i64
+    }
+
+    pub(crate) fn dims(&self) -> Dims {
+        Dims::new(self.width, self.height)
+    }
+
+    /// Largest rectangle contained in both rectangles; zero sized when they do
+    /// not overlap. Uses 64 bit intermediates so huge virtual desktops cannot
+    /// wrap around.
+    pub(crate) fn intersect(&self, other: &PixelRect) -> PixelRect {
+        let left = self.left.max(other.left);
+        let top = self.top.max(other.top);
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        if right <= left as i64 || bottom <= top as i64 {
+            return PixelRect::new(left, top, 0, 0);
+        }
+        PixelRect::new(
+            left,
+            top,
+            (right - left as i64) as u32,
+            (bottom - top as i64) as u32,
         )
-        .is_ok()
-            && cloaked != 0
     }
 }
 
-pub fn window_title(hwnd: HWND) -> String {
-    let mut buf = [0u16; 512];
-    let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
-    let n = n.max(0) as usize;
-    String::from_utf16_lossy(&buf[..n.min(buf.len())])
-}
-
-pub fn window_class(hwnd: HWND) -> String {
-    let mut buf = [0u16; 256];
-    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
-    let n = n.max(0) as usize;
-    String::from_utf16_lossy(&buf[..n.min(buf.len())])
-}
-
-/// Client-area rectangle in physical desktop coordinates. WGC captures window
-/// content rather than the non-client frame, so this is the correct overlay rect.
-pub fn client_rect_on_screen(hwnd: HWND) -> Option<RECT> {
-    let mut client = RECT::default();
-    if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
-        return None;
-    }
-    let mut origin = POINT { x: 0, y: 0 };
-    if !unsafe { ClientToScreen(hwnd, &mut origin) }.as_bool() {
-        return None;
-    }
-    Some(RECT {
-        left: origin.x,
-        top: origin.y,
-        right: origin.x + client.right - client.left,
-        bottom: origin.y + client.bottom - client.top,
-    })
-}
-
-/// A conservative predicate for following the foreground window. Desktop
-/// shell windows and tiny transient popups are not useful capture targets.
-pub fn is_capturable_window(hwnd: HWND) -> bool {
-    if !is_window(hwnd) || is_iconic(hwnd) || !unsafe { IsWindowVisible(hwnd).as_bool() } {
-        return false;
-    }
-    if is_own_process_window(hwnd) || is_cloaked(hwnd) {
-        return false;
-    }
-    if unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd {
-        return false;
-    }
-    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
-    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
-        return false;
-    }
-    if ex_style & WS_EX_TOOLWINDOW.0 != 0 && window_title(hwnd).is_empty() {
-        return false;
-    }
-    let class = window_class(hwnd);
-    if matches!(
-        class.as_str(),
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-    ) {
-        return false;
-    }
-    let Some(rect) = window_bounds(hwnd) else {
-        return false;
-    };
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-    width >= 160 && height >= 120
-}
-
-/// A permissive foreground-candidate check used for game/video windows.
-/// Exclusive-fullscreen games can report unusual styles or `IsWindowVisible`
-/// false, so the stricter enumeration filter is intentionally not used here.
-pub fn is_foreground_capture_candidate(hwnd: HWND) -> bool {
-    if !is_window(hwnd) || is_own_process_window(hwnd) {
-        return false;
-    }
-    let class = window_class(hwnd);
-    if matches!(
-        class.as_str(),
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-    ) {
-        return false;
-    }
-    let Some(rect) = window_bounds(hwnd) else {
-        return false;
-    };
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-    width >= 160 && height >= 120
-}
-
-pub fn window_process_id(hwnd: HWND) -> u32 {
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    pid
-}
-
-pub fn is_own_process_window(hwnd: HWND) -> bool {
-    window_process_id(hwnd) == unsafe { GetCurrentProcessId() }
-}
-
-/// Foreground window normalized to its top-level root.
-pub fn foreground_window() -> Option<HWND> {
-    let fg = unsafe { GetForegroundWindow() };
-    if fg.0.is_null() {
-        return None;
-    }
-    let root = unsafe { GetAncestor(fg, GA_ROOT) };
-    let target = if root.0.is_null() { fg } else { root };
-    is_window(target).then_some(target)
-}
-
-/// Build a selectable entry for one window, even when it was not produced by
-/// the regular enumeration (for example, "use last foreground window").
-pub fn window_info(hwnd: HWND) -> Option<WinEnum> {
-    if !is_window(hwnd) {
-        return None;
-    }
-    if is_own_process_window(hwnd) {
-        return None;
-    }
-    let rect = window_bounds(hwnd)?;
-    let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
-    if w < 80 || h < 60 {
-        return None;
-    }
-    Some(WinEnum {
-        hwnd: hwnd.0 as isize,
-        title: window_title(hwnd),
-        class: window_class(hwnd),
-        rect: (rect.left, rect.top, rect.right, rect.bottom),
-    })
-}
-
-unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let list = &mut *(lparam.0 as *mut Vec<HWND>);
-    list.push(hwnd);
-    true.into()
-}
-
-/// Enumerate visible top-level windows. The filter is intentionally permissive:
-/// games and video players often have empty titles, non-standard classes, or
-/// tool-window styles. The UI sorts large/foreground windows first.
-pub fn enumerate_windows() -> Vec<WinEnum> {
-    let mut hwnds: Vec<HWND> = Vec::new();
-    unsafe {
-        let _ = EnumWindows(Some(enum_cb), LPARAM(&mut hwnds as *mut _ as isize));
-    }
-
-    let foreground = foreground_window();
-    let mut out: Vec<(WinEnum, bool)> = Vec::new();
-    for hwnd in hwnds {
-        if is_own_process_window(hwnd) {
-            continue;
-        }
-        if !unsafe { IsWindowVisible(hwnd).as_bool() } || is_iconic(hwnd) {
-            continue;
-        }
-        if is_cloaked(hwnd) {
-            continue;
-        }
-
-        let Some(rect) = window_bounds(hwnd) else {
-            continue;
-        };
-        let w = rect.right - rect.left;
-        let h = rect.bottom - rect.top;
-        if w < 120 || h < 80 {
-            continue;
-        }
-
-        let class = window_class(hwnd);
-        let title = window_title(hwnd);
-        if title.is_empty() && class.is_empty() {
-            continue;
-        }
-
-        if matches!(
-            class.as_str(),
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-        ) {
-            continue;
-        }
-        if h < 120 {
-            continue;
-        }
-
-        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
-        let is_tool = ex_style & WS_EX_TOOLWINDOW.0 != 0;
-        if is_tool && w < 640 && h < 360 {
-            continue;
-        }
-
-        out.push((
-            WinEnum {
-                hwnd: hwnd.0 as isize,
-                title,
-                class,
-                rect: (rect.left, rect.top, rect.right, rect.bottom),
-            },
-            foreground == Some(hwnd),
+/// Resolve the capture rectangle inside a window (window local coordinates).
+///
+/// Returns the clipped crop and its dimensions. A region that does not overlap
+/// the captured content is a configuration error naming both rectangles.
+pub(crate) fn capture_region(content: Dims, region: Option<Rect>) -> Result<(Rect, Dims)> {
+    if content.is_empty() {
+        return Err(FluidError::invalid(
+            "window has no capturable content (it may be minimized or fully off screen)",
         ));
     }
-
-    // Foreground first, then large windows. This makes fullscreen games and
-    // videos appear near the top even if their title is empty.
-    out.sort_by(|(a, a_fg), (b, b_fg)| {
-        b_fg.cmp(a_fg)
-            .then_with(|| b.area().cmp(&a.area()))
-            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-    });
-    out.into_iter().map(|(w, _)| w).collect()
-}
-
-/// Re-locate a remembered window by title + class, preferring the largest match.
-pub fn find_window_by_ref(win: &WindowRef) -> Option<HWND> {
-    let all = enumerate_windows();
-    let mut best: Option<(&WinEnum, i64)> = None;
-    for w in &all {
-        let title_matches = win.title.is_empty() || w.title == win.title;
-        if title_matches && (win.class.is_empty() || w.class == win.class) {
-            let area = w.area();
-            if best.is_none_or(|(_, a)| area > a) {
-                best = Some((w, area));
+    match region {
+        None => Ok((Rect::from_dims(content), content)),
+        Some(requested) => {
+            let clipped = requested.intersect(content);
+            if clipped.is_empty() {
+                return Err(FluidError::invalid(format!(
+                    "window capture region {}x{} at ({}, {}) does not intersect the {} window content",
+                    requested.w, requested.h, requested.x, requested.y, content
+                )));
             }
+            Ok((clipped, clipped.dims()))
         }
     }
-    best.map(|(w, _)| hwnd_from_isize(w.hwnd))
 }
 
-/// Return the currently active foreground root window if it is not fluid.
-pub fn external_foreground_window() -> Option<HWND> {
-    foreground_window().filter(|hwnd| !is_own_process_window(*hwnd))
+/// Map a window local crop to desktop coordinates: frame origin plus offset.
+pub(crate) fn screen_rect(frame: PixelRect, region: Rect) -> PixelRect {
+    PixelRect::new(
+        frame.left.saturating_add(region.x as i32),
+        frame.top.saturating_add(region.y as i32),
+        region.w,
+        region.h,
+    )
 }
 
-static LAST_EXTERNAL_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
-
-/// Lightweight background watcher so foreground-window mode still knows the
-/// last external window after the fluid settings window takes focus.
-pub fn start_foreground_watcher() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let _ = std::thread::Builder::new()
-            .name("fluid-foreground-watch".into())
-            .spawn(|| loop {
-                if let Some(hwnd) = external_foreground_window() {
-                    LAST_EXTERNAL_FOREGROUND.store(hwnd.0 as isize, Ordering::Relaxed);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            });
-    });
-}
-
-pub fn last_external_foreground_window() -> Option<HWND> {
-    let value = LAST_EXTERNAL_FOREGROUND.load(Ordering::Relaxed);
-    if value == 0 {
-        return None;
+/// Re-emit "cached" with a fresh timestamp and sequence number.
+///
+/// Used when the window produced no new content (minimized, static, closed or
+/// temporarily unreadable) so the engine sees a normal frame instead of the end
+/// of the stream. A cached frame of the wrong shape is replaced by black to
+/// keep the invariant that every returned frame has "dims".
+pub(crate) fn replay(cached: &Frame, dims: Dims, pts_ns: i64, index: u64) -> Frame {
+    let expected = dims.area() as usize * 4;
+    let data = if cached.dims == dims && cached.data.len() == expected {
+        cached.data.clone()
+    } else {
+        vec![0u8; expected]
+    };
+    Frame {
+        dims,
+        fmt: PixelFormat::Rgba8,
+        data,
+        pts_ns,
+        index,
     }
-    let hwnd = hwnd_from_isize(value);
-    window_info(hwnd).map(|info| hwnd_from_isize(info.hwnd))
 }
 
-pub fn monitor_of(hwnd: HWND) -> isize {
-    crate::monitor::monitor_from_window(hwnd).0 as isize
+/// Case insensitive substring match used by "WindowSelector::title_contains".
+fn title_matches(title: &str, needle: &str) -> bool {
+    let title = title.to_lowercase();
+    let needle = needle.to_lowercase();
+    title.contains(&needle)
 }
 
-/// Compute the target-window rectangle inside the captured output frame.
-pub fn uv_rect(output: &RECT, window: &RECT) -> [f32; 4] {
-    let ow = (output.right - output.left).max(1) as f32;
-    let oh = (output.bottom - output.top).max(1) as f32;
-    let l = (window.left - output.left).clamp(0, output.right - output.left) as f32;
-    let t = (window.top - output.top).clamp(0, output.bottom - output.top) as f32;
-    let r = (window.right - output.left).clamp(0, output.right - output.left) as f32;
-    let b = (window.bottom - output.top).clamp(0, output.bottom - output.top) as f32;
-    [l / ow, t / oh, r / ow, b / oh]
+/// Executable name comparison used by "WindowSelector::process".
+///
+/// Accepts the file name with or without the ".exe" suffix in either side, so
+/// "notepad" matches "notepad.exe" and "Notepad.EXE" matches "notepad".
+fn process_matches(candidate: &str, needle: &str) -> bool {
+    let candidate = candidate.trim();
+    let needle = needle.trim();
+    if candidate.eq_ignore_ascii_case(needle) {
+        return true;
+    }
+    let strip = |name: &str| {
+        let name = name.to_lowercase();
+        name.strip_suffix(".exe").unwrap_or(&name).to_string()
+    };
+    !candidate.is_empty() && strip(candidate) == strip(needle)
+}
+
+/// Pick the single window described by a selector.
+///
+/// With an explicit id the lookup is exact. With title/process filters every
+/// set filter must match; exactly one match is returned, an exact title match
+/// wins over partial matches, and several remaining candidates produce an
+/// error that lists them so the caller can retry with an id.
+pub(crate) fn select_window<'a>(
+    windows: &'a [WindowInfo],
+    selector: &WindowSelector,
+) -> Result<&'a WindowInfo> {
+    if let Some(id) = selector.id {
+        return windows.iter().find(|window| window.id == id).ok_or_else(|| {
+            FluidError::invalid(format!(
+                "window id {id} is not in the current window list ({} windows visible); list the windows and pick another id",
+                windows.len()
+            ))
+        });
+    }
+    let title = selector
+        .title_contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let process = selector
+        .process
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    if title.is_none() && process.is_none() {
+        return Err(FluidError::invalid(
+            "window selector needs an id, a title substring or a process name",
+        ));
+    }
+    let candidates: Vec<&WindowInfo> = windows
+        .iter()
+        .filter(|window| title.is_none_or(|needle| title_matches(&window.title, needle)))
+        .filter(|window| process.is_none_or(|needle| process_matches(&window.process_name, needle)))
+        .collect();
+    match candidates.len() {
+        0 => Err(FluidError::invalid(format!(
+            "no visible window matches title {:?} / process {:?} ({} windows enumerated)",
+            title.unwrap_or(""),
+            process.unwrap_or(""),
+            windows.len()
+        ))),
+        1 => Ok(candidates[0]),
+        _ => {
+            // A full title match is an unambiguous choice even if other titles
+            // merely contain the same text.
+            if let Some(needle) = title
+                && let Some(exact) = candidates
+                    .iter()
+                    .find(|window| window.title.eq_ignore_ascii_case(needle))
+            {
+                return Ok(exact);
+            }
+            let listing = candidates
+                .iter()
+                .take(8)
+                .map(|window| {
+                    format!(
+                        "#{} {:?} ({})",
+                        window.id, window.title, window.process_name
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(FluidError::invalid(format!(
+                "{} windows match the selector; retry with an explicit window id: {listing}",
+                candidates.len()
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
-        RECT {
-            left: l,
-            top: t,
-            right: r,
-            bottom: b,
+    use crate::mock_frame;
+
+    fn info(id: u64, title: &str, process: &str) -> WindowInfo {
+        WindowInfo {
+            id,
+            title: title.to_string(),
+            class_name: "TestClass".to_string(),
+            process_name: process.to_string(),
+            dims: Dims::new(320, 240),
+            left: 0,
+            top: 0,
+            visible: true,
+            minimized: false,
+        }
+    }
+
+    fn selector(id: Option<u64>, title: Option<&str>, process: Option<&str>) -> WindowSelector {
+        WindowSelector {
+            id,
+            title_contains: title.map(str::to_string),
+            process: process.map(str::to_string),
         }
     }
 
     #[test]
-    fn uv_rect_identity_on_same_origin() {
-        let out = rect(0, 0, 1920, 1080);
-        let win = rect(0, 0, 1920, 1080);
-        assert_eq!(uv_rect(&out, &win), [0.0, 0.0, 1.0, 1.0]);
+    fn window_info_formats_for_listings() {
+        let mut window = info(4660, "Untitled - Notepad", "notepad.exe");
+        window.left = -1920;
+        window.top = 64;
+        assert_eq!(
+            window.to_string(),
+            "[4660] Untitled - Notepad 320x240 at (-1920, 64) (notepad.exe)"
+        );
+        window.minimized = true;
+        assert!(window.to_string().ends_with("(minimized)"));
     }
 
     #[test]
-    fn uv_rect_subwindow() {
-        let out = rect(0, 0, 1920, 1080);
-        let win = rect(960, 540, 1920, 1080);
-        assert_eq!(uv_rect(&out, &win), [0.5, 0.5, 1.0, 1.0]);
+    fn selector_requires_a_criterion() {
+        let windows = [info(1, "A", "a.exe")];
+        assert!(select_window(&windows, &WindowSelector::default()).is_err());
+        let blank = selector(None, Some("   "), Some(""));
+        assert!(select_window(&windows, &blank).is_err());
     }
 
     #[test]
-    fn uv_rect_offset_output_and_clamp() {
-        let out = rect(1920, 0, 3840, 1080);
-        let win = rect(1600, -100, 3840, 1080);
-        assert_eq!(uv_rect(&out, &win), [0.0, 0.0, 1.0, 1.0]);
+    fn selector_by_id_wins_over_filters() {
+        let windows = [info(10, "Alpha", "a.exe"), info(20, "Beta", "b.exe")];
+        let picked = select_window(&windows, &selector(Some(20), Some("Alpha"), None)).unwrap();
+        assert_eq!(picked.id, 20);
+        // A missing id is reported clearly.
+        let error = select_window(&windows, &selector(Some(99), None, None)).unwrap_err();
+        assert!(error.to_string().contains("99"), "{error}");
+    }
+
+    #[test]
+    fn selector_matches_titles_case_insensitively() {
+        let windows = [
+            info(1, "Untitled - Notepad", "notepad.exe"),
+            info(2, "Visual Studio Code", "Code.exe"),
+        ];
+        let picked = select_window(&windows, &selector(None, Some("notepad"), None)).unwrap();
+        assert_eq!(picked.id, 1);
+        let picked = select_window(&windows, &selector(None, Some("visual studio"), None)).unwrap();
+        assert_eq!(picked.id, 2);
+    }
+
+    #[test]
+    fn selector_process_matches_with_or_without_exe_suffix() {
+        assert!(process_matches("notepad.exe", "notepad"));
+        assert!(process_matches("notepad", "Notepad.EXE"));
+        assert!(process_matches("Code.exe", "code.exe"));
+        assert!(!process_matches("notepad.exe", "code"));
+        let windows = [info(7, "x", "Notepad.exe")];
+        assert_eq!(
+            select_window(&windows, &selector(None, None, Some("notepad")))
+                .unwrap()
+                .id,
+            7
+        );
+        // Title and process filters are combined with AND.
+        assert!(select_window(&windows, &selector(None, Some("x"), Some("code"))).is_err());
+    }
+
+    #[test]
+    fn selector_prefers_an_exact_title_and_reports_ambiguity() {
+        let windows = [
+            info(1, "Notes", "one.exe"),
+            info(2, "Notes - Extra", "two.exe"),
+        ];
+        let picked = select_window(&windows, &selector(None, Some("notes"), None)).unwrap();
+        assert_eq!(picked.id, 1, "exact title wins over a partial match");
+
+        let windows = [info(1, "Notes", "one.exe"), info(2, "notes", "two.exe")];
+        let error = select_window(&windows, &selector(None, Some("note"), None)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("#1"), "{message}");
+        assert!(message.contains("#2"), "{message}");
+    }
+
+    #[test]
+    fn capture_region_defaults_to_the_whole_window() {
+        let dims = Dims::new(128, 72);
+        let (region, size) = capture_region(dims, None).unwrap();
+        assert_eq!(region, Rect::new(0, 0, 128, 72));
+        assert_eq!(size, dims);
+    }
+
+    #[test]
+    fn capture_region_clips_odd_offsets_inside_the_window() {
+        let (region, size) =
+            capture_region(Dims::new(100, 60), Some(Rect::new(90, 50, 30, 20))).unwrap();
+        assert_eq!(region, Rect::new(90, 50, 10, 10));
+        assert_eq!(size, Dims::new(10, 10));
+
+        let (region, size) =
+            capture_region(Dims::new(101, 61), Some(Rect::new(3, 5, 7, 9))).unwrap();
+        assert_eq!(region, Rect::new(3, 5, 7, 9));
+        assert_eq!(size, Dims::new(7, 9));
+    }
+
+    #[test]
+    fn capture_region_outside_the_window_is_an_error() {
+        let error =
+            capture_region(Dims::new(100, 60), Some(Rect::new(200, 0, 10, 10))).unwrap_err();
+        assert!(error.to_string().contains("does not intersect"), "{error}");
+        let empty = capture_region(Dims::new(0, 0), None).unwrap_err();
+        assert!(
+            empty.to_string().contains("no capturable content"),
+            "{empty}"
+        );
+    }
+
+    #[test]
+    fn pixel_rects_handle_negative_secondary_monitor_origins() {
+        let window = PixelRect::new(-1920, 64, 800, 600);
+        let screen = PixelRect::new(-1920, 0, 1920, 1080);
+        let overlap = window.intersect(&screen);
+        assert_eq!(overlap, window);
+
+        // Partially off the left edge: only 700 columns remain visible.
+        let window = PixelRect::new(-2000, 64, 800, 600);
+        let overlap = window.intersect(&screen);
+        assert_eq!(overlap, PixelRect::new(-1920, 64, 720, 600));
+
+        // No overlap at all yields an empty rectangle at the clamped origin.
+        let window = PixelRect::new(4000, 0, 100, 100);
+        assert!(window.intersect(&screen).is_empty());
+    }
+
+    #[test]
+    fn pixel_rect_intersection_does_not_overflow() {
+        let huge = PixelRect::new(i32::MAX - 10, i32::MAX - 10, u32::MAX, u32::MAX);
+        let other = PixelRect::new(0, 0, 100, 100);
+        assert!(huge.intersect(&other).is_empty());
+    }
+
+    #[test]
+    fn screen_rect_maps_a_window_crop_to_the_desktop() {
+        let frame = PixelRect::new(-1920, 64, 800, 600);
+        let screen = screen_rect(frame, Rect::new(10, 20, 640, 360));
+        assert_eq!(screen, PixelRect::new(-1910, 84, 640, 360));
+        assert_eq!(screen.dims(), Dims::new(640, 360));
+    }
+
+    #[test]
+    fn replay_keeps_pixels_and_updates_identity() {
+        let dims = Dims::new(16, 8);
+        let cached = mock_frame(dims, 0.25, 3);
+        let repeated = replay(&cached, dims, 1234, 9);
+        assert_eq!(repeated.dims, dims);
+        assert_eq!(repeated.fmt, PixelFormat::Rgba8);
+        assert_eq!(repeated.data, cached.data);
+        assert_eq!(repeated.pts_ns, 1234);
+        assert_eq!(repeated.index, 9);
+
+        // A stale buffer of another shape is replaced by black rather than
+        // handed to the engine with a mismatched length.
+        let repeated = replay(&cached, Dims::new(8, 8), 1, 2);
+        assert_eq!(repeated.dims, Dims::new(8, 8));
+        assert_eq!(repeated.data.len(), 8 * 8 * 4);
+        assert!(repeated.data.iter().all(|&byte| byte == 0));
+    }
+
+    /// Minimal stand-in for a window source: either produces a fresh pattern
+    /// frame or replays the previous one while the fake window is minimized.
+    struct FakeWindowSource {
+        dims: Dims,
+        cached: Frame,
+        minimized: bool,
+        index: u64,
+    }
+
+    impl FrameSource for FakeWindowSource {
+        fn dims(&self) -> Dims {
+            self.dims
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "fake-window"
+        }
+
+        fn next_frame(&mut self) -> Result<Option<Frame>> {
+            let pts_ns = 100 + self.index as i64 * 10;
+            let frame = if self.minimized {
+                replay(&self.cached, self.dims, pts_ns, self.index)
+            } else {
+                mock_frame(
+                    self.dims,
+                    (self.index as f64 / 120.0).rem_euclid(1.0),
+                    self.index,
+                )
+            };
+            self.cached = frame.clone();
+            self.index += 1;
+            Ok(Some(frame))
+        }
+    }
+
+    #[test]
+    fn minimized_windows_replay_the_previous_frame_forever() {
+        let dims = Dims::new(32, 16);
+        let mut source = FakeWindowSource {
+            dims,
+            cached: mock_frame(dims, 0.0, 0),
+            minimized: false,
+            index: 0,
+        };
+        let first = source.next_frame().unwrap().unwrap();
+        source.minimized = true;
+        let mut previous = first.checksum();
+        for expected_index in 1..6 {
+            let frame = source
+                .next_frame()
+                .unwrap()
+                .expect("a window source never ends");
+            assert_eq!(frame.dims, dims);
+            assert_eq!(frame.index, expected_index);
+            assert!(frame.pts_ns > 0);
+            assert_eq!(frame.checksum(), previous, "pixels are replayed unchanged");
+            previous = frame.checksum();
+        }
+        // Restoring the window resumes fresh content.
+        source.minimized = false;
+        let resumed = source.next_frame().unwrap().unwrap();
+        assert_ne!(resumed.checksum(), previous);
     }
 }

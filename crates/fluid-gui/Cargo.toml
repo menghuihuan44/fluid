@@ -1,0 +1,52 @@
+[package]
+name = "fluid-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Fluid GUI - beginner-friendly frame generation and upscaling"
+
+[[bin]]
+name = "fluid-gui"
+path = "src/main.rs"
+
+# The Android APK needs a shared library (jniLibs/arm64-v8a/libfluid_gui.so) that
+# the Kotlin shell loads with System.loadLibrary("fluid_gui"). The library owns all
+# the GUI code plus the android_main / JNI entry points (src/lib.rs); src/main.rs is
+# a thin desktop binary, so no file belongs to two build targets.
+[lib]
+name = "fluid_gui"
+path = "src/lib.rs"
+# cdylib for the Android APK, rlib so the desktop bin can call fluid_gui::run().
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+eframe.workspace = true
+winit.workspace = true
+fluid-core.workspace = true
+fluid-engine.workspace = true
+fluid-capture.workspace = true
+fluid-present.workspace = true
+fluid-video.workspace = true
+# Adapter probe for the background GPU warm-up (the device itself is created by
+# the engine's process-wide context, so the warm-up goes through a tiny Pipeline).
+fluid-gpu.workspace = true
+
+# Native file dialogs for the 视频处理 tab. Only needed on the desktop; on
+# Android rfd has no file picker, so the tab keeps editable path fields there.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# JNI glue between the Kotlin shell (android/) and fluid-capture / fluid-present.
+# The Android build is a cdylib loaded with System.loadLibrary("fluid_gui").
+jni.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Same version the capture/present backends already use: EnumWindows + window
+# title lookup and SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) so the
+# 全屏输出 viewport is invisible to our own DXGI capture (no infinite mirror).
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

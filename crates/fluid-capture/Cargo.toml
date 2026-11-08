@@ -2,27 +2,38 @@
 name = "fluid-capture"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Cross-platform screen capture backends for Fluid."
 
 [dependencies]
+fluid-core.workspace = true
+serde.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Windows crate: DXGI Desktop Duplication (monitor capture and the window
+# capture fallback) plus Windows.Graphics.Capture for single window capture.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Dwm",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Performance",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
     "Win32_System_Threading",
-    "Win32_System_WinRT",
-    "Win32_System_WinRT_Direct3D11",
-    "Win32_System_WinRT_Graphics_Capture",
-    "Foundation",
+    "Win32_UI_WindowsAndMessaging",
     "Graphics_Capture",
-    "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_WinRT_Direct3D11",
 ] }
-thiserror.workspace = true
-tracing.workspace = true
-fluid-core.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+# MediaProjection -> ImageReader plumbing over JNI, plus AHardwareBuffer readback
+# from the NDK. "nativewindow" links libnativewindow (hardware_buffer APIs).
+jni.workspace = true
+ndk-sys = { workspace = true, features = ["nativewindow"] }
+

@@ -1,0 +1,22 @@
+[package]
+name = "fluid-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pipeline glue, pacing and telemetry for Fluid."
+
+[dependencies]
+fluid-core.workspace = true
+fluid-flow.workspace = true
+fluid-interp.workspace = true
+fluid-upscale.workspace = true
+fluid-capture.workspace = true
+fluid-present.workspace = true
+fluid-video.workspace = true
+fluid-gpu.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

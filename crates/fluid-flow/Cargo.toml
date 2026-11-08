@@ -1,0 +1,13 @@
+[package]
+name = "fluid-flow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Optical flow estimation and scene-cut detection for Fluid."
+
+[dependencies]
+fluid-core.workspace = true
+serde.workspace = true
+wide.workspace = true

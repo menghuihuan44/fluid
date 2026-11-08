@@ -1,0 +1,13 @@
+# Gradle / Android Studio state
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# cargo-ndk output: regenerate with scripts/build-android.ps1 instead of committing
+# multi-megabyte per-ABI shared libraries.
+app/src/main/jniLibs/

@@ -1,0 +1,19 @@
+[package]
+name = "fluid-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "wgpu compute upscaling backend for Fluid (Windows, Android, cross-platform)."
+
+[dependencies]
+fluid-core.workspace = true
+fluid-flow.workspace = true
+fluid-upscale.workspace = true
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "dx12", "wgsl"] }
+bytemuck = "1"
+
+[dev-dependencies]
+fluid-interp.workspace = true
+serde_json.workspace = true

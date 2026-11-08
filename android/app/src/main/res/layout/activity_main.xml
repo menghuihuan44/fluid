@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#101418"
+    android:fitsSystemWindows="true"
+    android:padding="12dp">
+
+    <TextView
+        android:id="@+id/status_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="#d7dde3"
+        android:textSize="14sp"
+        android:text="@string/status_idle" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:text="@string/interp_label"
+        android:textColor="#9aa6b2"
+        android:textSize="13sp" />
+
+    <RadioGroup
+        android:id="@+id/interp_group"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/interp_off"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="@string/interp_off"
+            android:textColor="#d7dde3" />
+
+        <RadioButton
+            android:id="@+id/interp_2x"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:checked="true"
+            android:text="@string/interp_2x"
+            android:textColor="#d7dde3" />
+
+        <RadioButton
+            android:id="@+id/interp_3x"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="@string/interp_3x"
+            android:textColor="#d7dde3" />
+    </RadioGroup>
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/scale_label"
+        android:textColor="#9aa6b2"
+        android:textSize="13sp" />
+
+    <RadioGroup
+        android:id="@+id/scale_group"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/scale_off"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:checked="true"
+            android:text="@string/scale_off"
+            android:textColor="#d7dde3" />
+
+        <RadioButton
+            android:id="@+id/scale_15"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="@string/scale_15"
+            android:textColor="#d7dde3" />
+
+        <RadioButton
+            android:id="@+id/scale_2"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="@string/scale_2"
+            android:textColor="#d7dde3" />
+    </RadioGroup>
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/quality_label"
+        android:textColor="#9aa6b2"
+        android:textSize="13sp" />
+
+    <RadioGroup
+        android:id="@+id/quality_group"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/quality_performance"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="@string/quality_performance"
+            android:textColor="#d7dde3" />
+
+        <RadioButton
+            android:id="@+id/quality_balanced"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:checked="true"
+            android:text="@string/quality_balanced"
+            android:textColor="#d7dde3" />
+
+        <RadioButton
+            android:id="@+id/quality_high"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="@string/quality_high"
+            android:textColor="#d7dde3" />
+    </RadioGroup>
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:layout_weight="1"
+        android:background="#000000">
+
+        <SurfaceView
+            android:id="@+id/surface_view"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+    </FrameLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/start_button"
+            android:layout_width="0dp"
+            android:layout_height="64dp"
+            android:layout_marginEnd="4dp"
+            android:layout_weight="1"
+            android:text="@string/start_enhance"
+            android:textSize="17sp" />
+
+        <Button
+            android:id="@+id/stop_button"
+            android:layout_width="0dp"
+            android:layout_height="64dp"
+            android:layout_marginStart="4dp"
+            android:layout_weight="1"
+            android:enabled="false"
+            android:text="@string/stop_enhance"
+            android:textSize="17sp" />
+    </LinearLayout>
+</LinearLayout>

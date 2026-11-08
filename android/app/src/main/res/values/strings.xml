@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fluid</string>
+    <string name="capture_title">Fluid 屏幕捕获</string>
+    <string name="capture_text">正在录制屏幕，插帧结果将显示在应用窗口里。</string>
+
+    <string name="interp_label">插帧倍率</string>
+    <string name="interp_off">关</string>
+    <string name="interp_2x">2x</string>
+    <string name="interp_3x">3x</string>
+
+    <string name="scale_label">分辨率提升</string>
+    <string name="scale_off">关</string>
+    <string name="scale_15">1.5x</string>
+    <string name="scale_2">2x</string>
+
+    <string name="quality_label">画质</string>
+    <string name="quality_performance">流畅</string>
+    <string name="quality_balanced">均衡</string>
+    <string name="quality_high">高画质</string>
+
+    <string name="start_enhance">开始增强</string>
+    <string name="stop_enhance">停止增强</string>
+    <string name="status_idle">尚未开始：点“开始增强”，系统会询问录屏权限。</string>
+</resources>

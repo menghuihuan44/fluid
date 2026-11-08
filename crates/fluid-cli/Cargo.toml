@@ -1,0 +1,30 @@
+[package]
+name = "fluid-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Command line interface for Fluid."
+
+[[bin]]
+name = "fluid"
+path = "src/main.rs"
+
+[dependencies]
+fluid-core.workspace = true
+fluid-engine.workspace = true
+fluid-capture.workspace = true
+fluid-present.workspace = true
+fluid-video.workspace = true
+fluid-gpu.workspace = true
+clap.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Only for the console control handler that makes Ctrl+C shut down gracefully
+# instead of terminating with 0xC000013A (see src/ctrl.rs).
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_HiDpi",
+] }
